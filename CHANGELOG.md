@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.14.10 — 2026-10-13
+
+- `proxy-addr` 2.0.7 → 2.0.8 in the lockfile (express 4 allows `~2.0.7`),
+  closing GHSA-jqcg-44mw-7w3h (critical).
+- `brace-expansion` override 1.1.20 → 1.1.21, closing GHSA-q2hr-2g5m-vwhr;
+  `npm audit` now reports 0 vulnerabilities.
+
 ## 2.14.9 — 2026-10-13
 
 - Runtime moves to Node 24 LTS: the image is built `FROM node:24-slim` and CI
