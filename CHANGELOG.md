@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.14.9 — 2026-10-13
+
+- Runtime moves to Node 24 LTS: the image is built `FROM node:24-slim` and CI
+  tests run in `node:24` (Node 20 is end-of-life).
+- `qs` is pinned to 6.16.0 through `overrides` (express 4 asks for `~6.15.1`),
+  closing GHSA-x5fp-wj9c-mxmx and GHSA-4mjr-xmp4-gh2g.
+
 ## 2.14.8 — 2026-10-07
 
 - Auto-login TOTP step moved to `src/totp-step.js`: waits up to
