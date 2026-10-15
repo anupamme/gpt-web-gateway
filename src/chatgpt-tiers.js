@@ -232,12 +232,12 @@ const tierAvailability = {
     const entry = strikes.get(strikeKey(mode, slotIdFrom(opts)));
     return entry ? entry.count : 0;
   },
-  // A verified selection is proof the tier is back — clear the memo immediately rather
-  // than making the caller wait out a cooldown that reality has already invalidated.
-  // Every slot's series for this tier goes with it: the memo is account-wide.
-  markAvailable(mode) {
+  // A verified selection is proof the tier is back for the account — clear the memo
+  // immediately. Only this slot's series ends. A neighbour that has not selected the
+  // tier keeps its own count, or one success would erase the other's observations.
+  markAvailable(mode, opts) {
     unavailable.delete(mode);
-    clearStrikes(mode);
+    strikes.delete(strikeKey(mode, slotIdFrom(opts)));
   },
   isCoolingDown(mode, { now = Date.now() } = {}) {
     const entry = unavailable.get(mode);

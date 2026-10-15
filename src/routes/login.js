@@ -253,19 +253,32 @@ router.post('/login/navigate', async (req, res) => {
   }
 });
 
-// Save session
-router.post('/login/save', async (req, res) => {
+// Saves share one exclusive. A second /login/save that merely waited on the
+// same acquire would keep going after the first release and close tabs out
+// from under jobs that had already been allowed to start.
+let saveChain = Promise.resolve();
+
+async function saveManualLogin() {
+  await enterManualLogin();
   try {
-    await enterManualLogin();
     await saveSession();
-    // Close login page
     if (loginPage && !loginPage.isClosed()) {
       await loginPage.close();
       loginPage = null;
     }
     // Session changed: no tab may keep a document from before the login.
     resetAllSlotPages();
+  } finally {
     releaseLoginHold();
+  }
+}
+
+// Save session
+router.post('/login/save', async (req, res) => {
+  const run = saveChain.then(() => saveManualLogin());
+  saveChain = run.then(() => {}, () => {});
+  try {
+    await run;
     res.json({ message: 'Session saved! Main page reset. You can now use the API.' });
   } catch (err) {
     res.status(500).json({ error: err.message });

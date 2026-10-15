@@ -355,6 +355,194 @@ add('status reports running and waiting slots', async () => {
   });
 });
 
+add('a streamed conversation_id stays on one slot', async () => {
+  const started = [];
+  let release;
+  const hold = new Promise((resolve) => { release = resolve; });
+  bridge.completeText = async (prompt, options) => {
+    started.push(prompt);
+    if (prompt === 'A' || prompt === 'A-again') await hold;
+    if (options.beforeSubmit) await options.beforeSubmit();
+    return { text: prompt, conversation_id: null, applied: { thinking: false, thinking_mode: 'instant' } };
+  };
+  await withRouter({
+    MAX_CONCURRENT_JOBS: 3, MAX_QUEUE_SIZE: 5, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 0,
+  }, async (port) => {
+    const a = request(port, 'POST', '/v1/chat/completions', {
+      input: 'A', conversation_id: CONV_A, stream: true,
+    });
+    a.catch(() => {});
+    try {
+      await waitUntil(() => started.includes('A'), 'stream A started');
+      const again = request(port, 'POST', '/v1/chat/completions', {
+        input: 'A-again', conversation_id: CONV_A, stream: true,
+      });
+      const b = request(port, 'POST', '/v1/chat/completions', {
+        input: 'B', conversation_id: CONV_B, stream: true,
+      });
+      again.catch(() => {});
+      b.catch(() => {});
+      await waitUntil(() => started.includes('B'), 'stream B started');
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.ok(!started.includes('A-again'), `stream overlapped: ${started.join(',')}`);
+      const status = await request(port, 'GET', '/v1/images/status', undefined, 1000);
+      assert.ok(
+        status.json.slots.some((slot) => slot.busy && slot.key === CONV_A),
+        JSON.stringify(status.json.slots),
+      );
+      release();
+      const results = await Promise.race([
+        Promise.all([a, again, b]),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('stream hung')), 2000)),
+      ]);
+      for (const result of results) assert.strictEqual(result.status, 200);
+    } finally {
+      release();
+    }
+  });
+});
+
+add('a batch pays the gap between images', async () => {
+  const times = [];
+  const original = stub.generateImage;
+  stub.generateImage = async (prompt, options) => {
+    await options.beforeSubmit();
+    times.push(Date.now());
+    return {
+      contentType: 'image/png', url: 'http://example.invalid/img',
+      applied: { thinking: false, thinking_mode: 'instant' },
+    };
+  };
+  try {
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: '0.08',
+    }, async (port) => {
+      const result = await request(port, 'POST', '/v1/images/generations', { prompt: 'cat', n: 2 });
+      assert.strictEqual(result.status, 200, JSON.stringify(result.json));
+      assert.strictEqual(times.length, 2, `turns ${times.length}`);
+      assert.ok(times[1] - times[0] >= 70, `gap ${times[1] - times[0]}`);
+    });
+  } finally {
+    stub.generateImage = original;
+  }
+});
+
+add('a queue_full capabilities probe does not stick', async () => {
+  let release;
+  const hold = new Promise((resolve) => { release = resolve; });
+  let entered = 0;
+  bridge.completeText = async () => {
+    entered += 1;
+    await hold;
+    return { text: 'ok', conversation_id: null, applied: { thinking: false, thinking_mode: 'instant' } };
+  };
+  let probed = 0;
+  const original = stub.probeCapabilities;
+  stub.probeCapabilities = async () => {
+    probed += 1;
+    return { thinking: false, thinking_mode: false, web_search: false, reference_images: false };
+  };
+  try {
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 0,
+    }, async (port) => {
+      const job = request(port, 'POST', '/v1/chat/completions', { input: 'hold' });
+      job.catch(() => {});
+      await waitUntil(() => entered === 1, 'holder entered');
+      const waiter = request(port, 'POST', '/v1/chat/completions', { input: 'wait' });
+      waiter.catch(() => {});
+      await waitUntil(async () => {
+        const status = await request(port, 'GET', '/v1/images/status', undefined, 1000);
+        return status.json.running === 1 && status.json.waiting === 1;
+      }, 'one waiter fills the queue');
+      const blocked = await request(port, 'GET', '/v1/images/capabilities', undefined, 1000);
+      assert.strictEqual(blocked.status, 429);
+      assert.strictEqual(blocked.json.error_kind, 'queue_full');
+      release();
+      await Promise.all([job, waiter]);
+      const again = await request(port, 'GET', '/v1/images/capabilities', undefined, 1000);
+      assert.strictEqual(again.status, 200, JSON.stringify(again.json));
+      assert.strictEqual(probed, 1);
+    });
+  } finally {
+    release();
+    stub.probeCapabilities = original;
+  }
+});
+
+add('parallel login saves do not reset after the exclusive is released', async () => {
+  const browserPath = require.resolve('../src/browser');
+  const loginPath = require.resolve('../src/routes/login');
+  const previousBrowser = require.cache[browserPath];
+  const previousLogin = require.cache[loginPath];
+  const previousHooks = stub.getPoolHooks;
+  const previousReset = stub.resetAllSlotPages;
+  const saves = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const browserMod = new Module(browserPath);
+  browserMod.filename = browserPath;
+  browserMod.loaded = true;
+  browserMod.exports = {
+    async saveSession() {
+      saves.push(saves.length);
+      if (saves.length === 1) await firstGate;
+    },
+    async getContext() { throw new Error('browser must not launch'); },
+    async maybeHideWebdriverOnPage() {},
+  };
+  require.cache[browserPath] = browserMod;
+  let held = 0;
+  let resetsOpen = 0;
+  stub.getPoolHooks = () => ({
+    acquireExclusive() {
+      held += 1;
+      let released = false;
+      return Promise.resolve(() => {
+        if (released) return;
+        released = true;
+        held -= 1;
+      });
+    },
+  });
+  stub.resetAllSlotPages = () => {
+    if (held <= 0) resetsOpen += 1;
+  };
+  delete require.cache[loginPath];
+  const loginRouter = require('../src/routes/login');
+  const server = await listen(loginRouter);
+  const port = server.address().port;
+  try {
+    const first = request(port, 'POST', '/login/save', {});
+    const second = request(port, 'POST', '/login/save', {});
+    first.catch(() => {});
+    second.catch(() => {});
+    await waitUntil(() => saves.length === 1, 'first save started');
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.strictEqual(saves.length, 1, 'second save ran beside the first');
+    releaseFirst();
+    const results = await Promise.race([
+      Promise.all([first, second]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('login save hung')), 2000)),
+    ]);
+    for (const result of results) assert.strictEqual(result.status, 200, result.text || JSON.stringify(result.json));
+    assert.strictEqual(resetsOpen, 0, 'a save reset pages after the exclusive was released');
+    assert.strictEqual(saves.length, 2);
+  } finally {
+    releaseFirst();
+    if (previousBrowser) require.cache[browserPath] = previousBrowser;
+    else delete require.cache[browserPath];
+    if (previousLogin) require.cache[loginPath] = previousLogin;
+    else delete require.cache[loginPath];
+    stub.getPoolHooks = previousHooks;
+    stub.resetAllSlotPages = previousReset;
+    await new Promise((resolve) => {
+      server.close(resolve);
+      server.closeAllConnections();
+    });
+  }
+});
+
 let finished = false;
 process.on('beforeExit', () => {
   if (!finished) {

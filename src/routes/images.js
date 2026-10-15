@@ -581,11 +581,13 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
     let maxAbVariants = 0;
     let abSelectedIndex = null;
     const errors = [];
-    const results = await submitJob((ctx) => runTurn(ctx, async ({ job, beforeSubmit }) => {
+    const results = await submitJob(async (ctx) => {
       const out = [];
       for (let i = 0; i < n; i++) {
         try {
-          const result = await generateImage(prompt, {
+          // One turn per image. finished() has to land before the next gate(),
+          // or the batch sends the rest of its prompts with no gap.
+          const result = await runTurn(ctx, ({ job, beforeSubmit }) => generateImage(prompt, {
             thinkingMode,
             aspectRatio,
             quality,
@@ -593,7 +595,7 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
             reuseChat: i > 0,
             job,
             beforeSubmit,
-          });
+          }));
           progress.touch(); // per-image heartbeat — long legit batches must not look stuck
           if (i === 0 && result.applied) firstApplied = result.applied;
           if (result.applied) turnTiers.push(result.applied);
@@ -633,7 +635,7 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
         }
       }
       return out;
-    }));
+    });
 
     incGenerations();
     bumpBatchMetric(n);
@@ -1066,7 +1068,7 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
           for (const chunk of emitter.push(fullText)) res.write(chunk);
         } catch {}
       },
-    })));
+    })), conversationKey(conversationId));
 
     ensureStreamStarted();
     for (const chunk of emitter.finish(result.text, {
@@ -1197,7 +1199,18 @@ async function getCapabilitiesSingleflight() {
     return { value: capsCache.value, cached: true, stale: true };
   }
   if (capsInFlight) return await capsInFlight;
-  capsInFlight = (async () => {
+  // submit() throws queue_full before its first await. An async function that
+  // is assigned only after it runs would store that rejected promise: its
+  // finally already cleared the slot, and every later probe re-awaits the same
+  // rejection until the process restarts.
+  let resolveFlight;
+  let rejectFlight;
+  const flight = new Promise((resolve, reject) => {
+    resolveFlight = resolve;
+    rejectFlight = reject;
+  });
+  capsInFlight = flight;
+  (async () => {
     try {
       const caps = await submitJob((ctx) => probeCapabilities({
         job: { slotId: ctx.slotId, jobId: ctx.jobId, epoch: ctx.epoch },
@@ -1222,12 +1235,14 @@ async function getCapabilitiesSingleflight() {
       if (!caps.error) {
         capsCache = { at: Date.now(), value: payload };
       }
-      return { value: payload, cached: false };
+      resolveFlight({ value: payload, cached: false });
+    } catch (err) {
+      rejectFlight(err);
     } finally {
-      capsInFlight = null;
+      if (capsInFlight === flight) capsInFlight = null;
     }
   })();
-  return await capsInFlight;
+  return await flight;
 }
 
 router.get('/v1/images/capabilities', async (req, res) => {

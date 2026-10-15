@@ -895,10 +895,9 @@ function closeWedgedPage(p) {
     if (p && (!p.isClosed || !p.isClosed())) p.close().catch(() => {});
   } catch {}
   const owner = p && pageToSlot.get(p);
-  if (owner && owner.page === p) {
-    owner.page = null;
-    pageToSlot.delete(p);
-  }
+  if (owner && owner.page === p) owner.page = null;
+  // Keep the page→slot binding. recreatePage resolves the slot through it, and
+  // dropping the binding makes that lookup fall back to slot 0.
 }
 
 // Race a promise against a wall-clock deadline that lives in NODE, not in the page.
@@ -3305,7 +3304,7 @@ async function setThinkingMode(p, modeOrEnabled, deps = {}) {
   // — the memo undoing a real recovery (Codex review).
   if (attempts[0] !== chain[0] && before.level === MODE_TO_LEVEL[chain[0]]) {
     console.log(`[ui-adapter] "${chain[0]}" is memoized as unavailable but the pill already shows it — clearing the memo`);
-    tierAvailability.markAvailable(chain[0]);
+    tierAvailability.markAvailable(chain[0], { slotId: menuSlot.id });
     attempts = chain;
   } else if (attempts[0] !== chain[0]) {
     console.log(`[ui-adapter] "${chain[0]}" is in cooldown (${cooledDownReason}) — going straight to "${attempts[0]}"`);
@@ -3334,7 +3333,7 @@ async function setThinkingMode(p, modeOrEnabled, deps = {}) {
       verified = true;
       after = before;
       console.log(`[ui-adapter] Intelligence already at ${targetLevel}`);
-      tierAvailability.markAvailable(mode);
+      tierAvailability.markAvailable(mode, { slotId: menuSlot.id });
       break;
     }
 
@@ -3347,7 +3346,7 @@ async function setThinkingMode(p, modeOrEnabled, deps = {}) {
     if (after.level === targetLevel) {
       verified = true;
       // Proof the tier is back — clear any memo rather than sitting out the cooldown.
-      tierAvailability.markAvailable(mode);
+      tierAvailability.markAvailable(mode, { slotId: menuSlot.id });
       break;
     }
 
@@ -3405,7 +3404,7 @@ async function setThinkingMode(p, modeOrEnabled, deps = {}) {
   if (adapterFailure) {
     // The menu itself is broken — that says nothing about tier availability, and a stale
     // memo would keep downgrading Pro requests long after the UI recovered.
-    tierAvailability.markAvailable(effectiveMode);
+    tierAvailability.markAvailable(effectiveMode, { slotId: menuSlot.id });
   }
 
   // appliedMode reflects what's REALLY active. Prefer the post-click pill read; if that
@@ -4331,5 +4330,7 @@ module.exports = {
     noteConversation: rememberConversation,
     bindPage,
     markHealthyCompletion,
+    closeWedgedPage,
+    slotOf,
   },
 };

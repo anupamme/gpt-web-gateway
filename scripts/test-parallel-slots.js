@@ -4,7 +4,7 @@ const chatgpt = require('../src/chatgpt');
 const { tierAvailability } = require('../src/chatgpt-tiers');
 
 const { getSlot, getPage, resetPage, hardResetBrowser, ensureLoggedIn, setPoolHooks, getPoolHooks } = chatgpt;
-const { acceptSseChunk, noteConversation, bindPage, markHealthyCompletion } = chatgpt._test;
+const { acceptSseChunk, noteConversation, bindPage, markHealthyCompletion, closeWedgedPage, slotOf } = chatgpt._test;
 
 const tests = [];
 const add = (name, fn) => tests.push([name, fn]);
@@ -110,6 +110,23 @@ add('tier strikes do not add across slots or break a neighbour series', () => {
   tierAvailability.noteUnavailable('pro', 'not-offered', { stickyAfter: 2, slotId: 0 });
   assert.strictEqual(tierAvailability.isCoolingDown('pro'), true);
   assert.strictEqual(tierAvailability.strikesFor('pro', { slotId: 0 }), 2);
+  tierAvailability.markAvailable('pro', { slotId: 1 });
+  assert.strictEqual(tierAvailability.isCoolingDown('pro'), false);
+  assert.strictEqual(tierAvailability.strikesFor('pro', { slotId: 0 }), 2, 'slot 1 success cleared slot 0');
+  assert.strictEqual(tierAvailability.strikesFor('pro', { slotId: 1 }), 0);
+});
+
+add('closing a wedged page keeps it bound to its own slot', () => {
+  const page0 = fakePage('https://chatgpt.com/');
+  const page1 = fakePage('https://chatgpt.com/');
+  bindPage(getSlot(0), page0);
+  bindPage(getSlot(1), page1);
+  closeWedgedPage(page1);
+  assert.strictEqual(slotOf(page1).id, 1);
+  assert.strictEqual(getSlot(1).page, null);
+  assert.strictEqual(getSlot(0).page, page0);
+  assert.strictEqual(slotOf(page0).id, 0);
+  assert.strictEqual(page0.closed, false);
 });
 
 add('a logged-out slot requests auto-login maintenance and does not run it', async () => {
