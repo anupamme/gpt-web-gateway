@@ -32,7 +32,8 @@ M03, M15, M21, M41, M45, M49, M50, M51. Точные замены и обосн�
    «Убит» засчитывается только при падении на ассерте теста (не при ошибке загрузки или
    синтаксиса). В каталог входят:
    - все мутации каталога `mutate-stall-m5.js`, кроме эквивалентных по отчёту (M01, M04,
-     M05, M48, M54) и невалидной M11. Фрагменты обновить под текущий код, СОХРАНИВ id и
+     M05, M48) и невалидной M11. M54 после M5b не эквивалентна и входит в каталог.
+     Фрагменты обновить под текущий код, СОХРАНИВ id и
      смысл мутации;
    - мутации на каждое исправление M5b, минимум по одной на пункт: D1 (`postAccepted` как
      подтверждение в цикле и на границе), D2 (дедлайн `screenshot` и `content`), D3
@@ -72,7 +73,7 @@ M03, M15, M21, M41, M45, M49, M50, M51. Точные замены и обосн�
 - **AC-004. Мутации прошлых вех по-прежнему убиваются.**
   `bash -c 'docker run --rm -u 1002:1002 -e HOME=/tmp -v "$PWD":/app -w /app node:24 sh -c "node scripts/mutate-parallel.js && node scripts/mutate-parallel-tabs.js"'`
 - **AC-005. Только тесты, боевой код не тронут, дерево чистое.**
-  `bash -c 'git diff --quiet c957473ce32744c386732e409731734938d3ff6b HEAD -- src scripts/mutate-stall-m5.js && test -z "$(git status --porcelain -- . ":(exclude)report.json" ":(exclude)report-blocked.md")" && test -z "$(git diff --name-only c957473ce32744c386732e409731734938d3ff6b HEAD | grep -vxE "scripts/test-stall-[a-z0-9-]+\.js|scripts/mutate-stall.js|package.json|docs/specs/stall-diagnostics-m5c-tests.md")" && test -z "$(git diff c957473ce32744c386732e409731734938d3ff6b HEAD -- package.json | grep -E "^[-+][^-+]" | grep -v "\"test\":")"'`
+  `bash -c 'git diff --quiet c957473ce32744c386732e409731734938d3ff6b HEAD -- src scripts/mutate-stall-m5.js && test -z "$(git status --porcelain -- . ":(exclude)report.json" ":(exclude)report-blocked.md")" && test -z "$(git diff --name-only c957473ce32744c386732e409731734938d3ff6b HEAD | grep -vxE "scripts/test-stall-[a-z0-9-]+\.js|scripts/mutate-stall.js|package.json|docs/specs/stall-diagnostics-m5c-tests.md|docs/specs/stall-diagnostics-m5c-followup.md")" && test -z "$(git diff c957473ce32744c386732e409731734938d3ff6b HEAD -- package.json | grep -E "^[-+][^-+]" | grep -v "\"test\":")"'`
 
 ## Авторевью
 
@@ -115,6 +116,14 @@ M03, M15, M21, M41, M45, M49, M50, M51. Точные замены и обосн�
 TAP-диагностика должна содержать `testCodeFailure` с `ERR_ASSERTION`;
 ошибки загрузки, синтаксиса, отмены и таймауты убийством не считаются.
 Исходные байты восстанавливаются в `finally`, хеш проверяется после каждого отката
-и в конце ворот. Новых исключений по эквивалентности нет; обоснования пяти
+и в конце ворот. Новых исключений по эквивалентности нет; обоснования четырёх
 исторических исключений сохранены в комментариях каталога. Результаты пяти
 критериев приёмки записываются отдельно в незакоммиченный `report.json`.
+
+Follow-up F1: ожидание дочерних процессов асинхронное, явные обработчики SIGTERM/SIGINT
+восстанавливают исходные байты с проверкой хеша, останавливают дочерний процесс и
+выходят с кодами 143/130. Два теста синхронизируются по уведомлению уже работающего
+мутированного теста в изолированной копии и проверяют хеши всех четырёх исходных файлов.
+Follow-up F2: M54 возвращена в каталог; POST ровно 200 без DOM-подтверждения
+проверяется существующим D1-тестом на единственную отправку и отсутствие новой страницы.
+Каталог содержит 61 мутацию: 49 M5 и 12 M5b.

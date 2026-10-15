@@ -16,7 +16,7 @@ for (const answer of [true, false]) {
   test(`D1: accepted POST without DOM confirmation sends once (answer=${answer})`, async () => {
     await fixture({ CHATGPT_TEXT_RETRY_ATTEMPTS: '4' }, async ({ chat, page, queue, pages }) => {
       const p = page({ unconfirmed: true, answer,
-        onSend: p => p.emit('response', response()) });
+        onSend: p => p.emit('response', response({ status: 200 })) });
       queue.push(p);
       const { output } = await logs(async () => {
         const turn = chat.completeText('hello', { thinkingMode: 'instant' });

@@ -2,13 +2,14 @@
 // Excluded from the catalogue (see stall-diagnostics-m5-mut-report.md):
 // M01: the outer branch already requires !bestText and diagnostics never assign it.
 // M04: throwBackendPostFailure rejects non-2xx first; 2xx is blocked by postStatus.
-// M05, M54: postStatus independently records the same 2xx acceptance.
+// M05: postStatus independently blocks stallNoAnswer for the same 2xx acceptance.
+// M54 is included: M5b also needs postAccepted to confirm a POST 200 without DOM evidence.
 // M48: the response listener ignores the returned promise; the IIFE still runs/catches.
 // M11: excluded by the spec as invalid (the old test throws before its assertion).
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { execFile } = require('node:child_process');
 
 const mutations = [
   {
@@ -444,6 +445,15 @@ const mutations = [
     test: "scripts/test-stall-diagnostics.js",
   },
   {
+    id: 'M54',
+    name: "^D1: accepted POST without DOM confirmation sends once \\(answer=true\\)$",
+    file: "src/chatgpt.js",
+    area: "postAccepted must include status 200 for submit confirmation",
+    from: "if (status >= 200 && status < 300) cap.postAccepted = true;",
+    to: "if (status > 200 && status < 300) cap.postAccepted = true;",
+    test: "scripts/test-stall-review.js",
+  },
+  {
     id: 'B01',
     name: "^D1: accepted POST exits confirmation polling immediately$",
     file: "src/chatgpt.js",
@@ -557,7 +567,7 @@ function sha256(bytes) {
   return crypto.createHash('sha256').update(bytes).digest('hex');
 }
 
-function runGate(root, catalog = mutations, { preflight = false, timeout = 30000 } = {}) {
+async function runGate(root, catalog = mutations, { preflight = false, timeout = 30000 } = {}) {
   const originals = new Map();
   const ids = new Set();
   // Preflight the entire catalogue before writing any file.
@@ -576,8 +586,17 @@ function runGate(root, catalog = mutations, { preflight = false, timeout = 30000
   console.log(`preflight: ${catalog.length} unique fragments`);
   if (preflight) return true;
 
-  const run = args => spawnSync(process.execPath, args, {
-    cwd: root, encoding: 'utf8', timeout, env: process.env,
+  let activeChild = null;
+  // Yield while a target runs so SIGTERM/SIGINT can restore an applied mutation.
+  const run = args => new Promise(resolve => {
+    activeChild = execFile(process.execPath, args, {
+      cwd: root, encoding: 'utf8', timeout, killSignal: 'SIGKILL', env: process.env,
+    }, (error, stdout, stderr) => {
+      activeChild = null;
+      resolve({ stdout, stderr, signal: error?.signal,
+        status: error ? (Number.isInteger(error.code) ? error.code : null) : 0,
+        error: error && !Number.isInteger(error.code) ? error : null });
+    });
   });
   // Match npm test's direct execution. --test's child-process transport is
   // incompatible with these tests' intentional stdout capture.
@@ -585,7 +604,7 @@ function runGate(root, catalog = mutations, { preflight = false, timeout = 30000
     ...(mutation.name ? ['--test-name-pattern', mutation.name] : []), mutation.test];
   const cleanTargets = new Set(catalog.map(m => m.test));
   for (const target of cleanTargets) {
-    const clean = run(['--test-reporter=tap', target]);
+    const clean = await run(['--test-reporter=tap', target]);
     if (clean.error || clean.status !== 0) {
       throw new Error(`clean ${target} failed\n${clean.stdout || ''}${clean.stderr || ''}`);
     }
@@ -601,11 +620,22 @@ function runGate(root, catalog = mutations, { preflight = false, timeout = 30000
     }
     activeFile = null;
   };
-  // Node's default SIGINT/SIGTERM handlers emit exit, even during spawnSync.
   const onExit = () => {
     try { restore(); } catch (error) { console.error(error); process.exitCode = 1; }
   };
+  const onSignal = signal => {
+    try { restore(); }
+    catch (error) { console.error(error); }
+    finally {
+      activeChild?.kill('SIGTERM');
+      process.exit(signal === 'SIGINT' ? 130 : 143);
+    }
+  };
+  const onSigterm = () => onSignal('SIGTERM');
+  const onSigint = () => onSignal('SIGINT');
   process.on('exit', onExit);
+  process.on('SIGTERM', onSigterm);
+  process.on('SIGINT', onSigint);
   let killed = 0;
   try {
     for (const mutation of catalog) {
@@ -619,11 +649,11 @@ function runGate(root, catalog = mutations, { preflight = false, timeout = 30000
         if (!applied.equals(Buffer.from(next)) || sha256(applied) === sha256(original)) {
           throw new Error(`${mutation.id}: replacement not applied`);
         }
-        const syntax = run(['--check', mutation.file]);
+        const syntax = await run(['--check', mutation.file]);
         if (syntax.error || syntax.status !== 0) {
           detail = `invalid syntax/check: ${syntax.error || syntax.stderr}`;
         } else {
-          const result = run(testArgs(mutation));
+          const result = await run(testArgs(mutation));
           const output = `${result.stdout || ''}\n${result.stderr || ''}`;
           // Only a real node:test assertion counts. A printed "AssertionError",
           // module-load error, cancellation, timeout or signal is not a kill.
@@ -647,7 +677,11 @@ function runGate(root, catalog = mutations, { preflight = false, timeout = 30000
       console.log(`${mutation.id} ${mutation.area}: ${detail}`);
     }
   } finally {
-    try { restore(); } finally { process.removeListener('exit', onExit); }
+    try { restore(); } finally {
+      process.removeListener('exit', onExit);
+      process.removeListener('SIGTERM', onSigterm);
+      process.removeListener('SIGINT', onSigint);
+    }
   }
   for (const [file, original] of originals) {
     if (sha256(fs.readFileSync(path.join(root, file))) !== sha256(original)) {
@@ -660,14 +694,14 @@ function runGate(root, catalog = mutations, { preflight = false, timeout = 30000
 
 if (require.main === module) {
   const only = process.argv.find(arg => arg.startsWith('--id='))?.slice(5);
-  try {
-    const catalog = only ? mutations.filter(m => m.id === only) : mutations;
-    process.exitCode = runGate(path.join(__dirname, '..'), catalog,
-      { preflight: process.argv.includes('--preflight') }) ? 0 : 1;
-  } catch (error) {
+  const catalog = only ? mutations.filter(m => m.id === only) : mutations;
+  runGate(path.join(__dirname, '..'), catalog,
+    { preflight: process.argv.includes('--preflight') }).then(ok => {
+    process.exitCode = ok ? 0 : 1;
+  }).catch(error => {
     console.error(error);
     process.exitCode = 1;
-  }
+  });
 }
 
 module.exports = { runGate, mutations };
