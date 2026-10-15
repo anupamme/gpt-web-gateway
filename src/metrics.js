@@ -25,6 +25,9 @@ const counters = {
     // The prompt is too long for the only input path that keeps attachments / a composer
     // token (per-key typing). Deterministic for that input: not retried, not an infra failure.
     prompt_too_long: 0,
+    request_timeout: 0,
+    client_aborted: 0,
+    invalid_request: 0,
   },
   generations_total: 0,
   edits_total: 0,
@@ -38,6 +41,7 @@ const DURATION_LABELS = [
   'success', 'refused', 'policy_violation', 'rate_limit', 'login_failed',
   'timeout', 'server_error', 'queue_full', 'upload_failed', 'page_load_failed',
   'conversation_not_found', 'tier_limit', 'prompt_too_long',
+  'request_timeout', 'client_aborted', 'invalid_request',
 ];
 
 function makeHistogramSeries() {
@@ -93,6 +97,7 @@ function shouldRetryKind(kind) {
   switch (kind) {
     case 'server_error':
     case 'timeout':
+    case 'request_timeout':
     case 'login_failed':
     case 'queue_full':
     case 'upload_failed':

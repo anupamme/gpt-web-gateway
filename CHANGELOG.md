@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.14.11 — 2026-10-15
+
+- Cancel disconnected or expired text requests before they can submit orphan
+  prompts. `X-Request-Timeout-Ms` includes queue wait; cancellation keeps browser
+  ownership until cleanup finishes and does not distort liveness failure streaks.
+- Bound text page reads in Node so an unresponsive renderer cannot bypass the
+  response deadline. Preserve long reasoning budgets on responsive pages.
+- `chat.sh` supports `CHATGPT_WEB_TIMEOUT_SECONDS`, retains structured JSON
+  errors and distinguishes transient HTTP 503 failures from login failures.
+
 ## 2.14.10 — 2026-10-13
 
 - `proxy-addr` 2.0.7 → 2.0.8 in the lockfile (express 4 allows `~2.0.7`),

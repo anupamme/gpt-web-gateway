@@ -7,6 +7,7 @@
 #   chat.sh - [flags]                 # read prompt from stdin
 #
 # Defaults: thinking_mode=standard.
+# CHATGPT_WEB_TIMEOUT_SECONDS: positive integer transport + server budget (default 1020).
 #
 # Flags:
 #   --instant            Use thinking_mode=instant (faster, no reasoning)
@@ -28,7 +29,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/.env"
 export CHATGPT_WEB_URL CHATGPT_WEB_USER CHATGPT_WEB_PASS
 
-CREDENTIALS=$(echo -n "${CHATGPT_WEB_USER}:${CHATGPT_WEB_PASS}" | base64)
+CREDENTIALS=$(printf '%s' "${CHATGPT_WEB_USER}:${CHATGPT_WEB_PASS}" | base64 | tr -d '\n')
+REQUEST_TIMEOUT_SECONDS="${CHATGPT_WEB_TIMEOUT_SECONDS:-1020}"
+if ! [[ "$REQUEST_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] || (( REQUEST_TIMEOUT_SECONDS > 86400 )); then
+    echo 'ERROR: CHATGPT_WEB_TIMEOUT_SECONDS must be an integer between 1 and 86400' >&2
+    exit 1
+fi
+REQUEST_TIMEOUT_MS=$(( REQUEST_TIMEOUT_SECONDS * 1000 ))
 
 usage() {
     cat <<'EOF'
@@ -145,26 +152,38 @@ else
     fi
 fi
 
-RESP=$(curl -sS -w '\n%{http_code}' -X POST "${CHATGPT_WEB_URL}${ENDPOINT}" \
+# Feed credentials through curl's stdin config, never its process arguments.
+TRANSPORT_FAILED=false
+RESP=$(printf 'header = "Authorization: Basic %s"\n' "$CREDENTIALS" | \
+    curl --config - -sS -w '\n%{http_code}' -X POST "${CHATGPT_WEB_URL}${ENDPOINT}" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Basic ${CREDENTIALS}" \
-    --max-time 1020 \
-    -d "$BODY")
+    -H "X-Request-Timeout-Ms: ${REQUEST_TIMEOUT_MS}" \
+    --max-time "$REQUEST_TIMEOUT_SECONDS" \
+    -d "$BODY") || TRANSPORT_FAILED=true
 HTTP_CODE=$(echo "$RESP" | tail -1)
 BODY_RESP=$(echo "$RESP" | sed '$d')
 
 emit_error() {
     if $JSON_OUT; then
-        printf '{"ok":false,"error":%s}\n' "$(jq -Rn --arg m "$1" '$m')"
+        jq -n --arg m "$1" '{ok:false,error_kind:"transport_error",should_retry:true,error:{message:$m}}'
     else
         echo "ERROR: $1" >&2
     fi
 }
 
+if $TRANSPORT_FAILED; then
+    emit_error "Request failed before a complete HTTP response (HTTP $HTTP_CODE)"
+    exit 1
+fi
+
 # API v1.2.6+ structured errors: { error_kind, should_retry, model_message, error:{...} }
 kind=$(echo "$BODY_RESP" | jq -r '.error_kind // empty' 2>/dev/null)
 model_msg=$(echo "$BODY_RESP" | jq -r '.model_message // empty' 2>/dev/null)
 msg=$(echo "$BODY_RESP" | jq -r '.error.message // empty' 2>/dev/null)
+if $JSON_OUT && [[ ! "$HTTP_CODE" =~ ^2 ]] && echo "$BODY_RESP" | jq -e 'type == "object" and .error_kind != null' >/dev/null 2>&1; then
+    # Preserve the service's machine-readable kind, retry policy and retry_after.
+    printf '%s\n' "$BODY_RESP"
+fi
 case "$HTTP_CODE" in
     2*) ;;
     422)
@@ -185,27 +204,29 @@ case "$HTTP_CODE" in
         exit 2
         ;;
     503)
-        # 503 is not always the session: since 2.10.0 an exhausted Pro quota lands here too,
-        # and telling the operator to "check credentials" for it sends them to the one place
-        # that is definitely fine. Branch on error_kind, keep the old text for everything else.
+        # Only an explicit login failure means credentials/session need attention.
         if [ "$kind" = "tier_limit" ]; then
             echo "TIER_LIMIT: ${msg:-tier quota exhausted}. Повторите запрос — он уйдёт на fallback-тир (Extra High)." >&2
             [ -n "$model_msg" ] && echo "  model_message: ${model_msg:0:300}" >&2
             exit 1
         fi
-        echo "LOGIN_FAILED: ${msg:-auth failed}. Проверьте credentials." >&2
-        exit 4
+        if [ "$kind" = "login_failed" ]; then
+            echo "LOGIN_FAILED: ${msg:-auth failed}. Проверьте credentials." >&2
+            exit 4
+        fi
+        echo "UNAVAILABLE: ${msg:-temporarily unavailable}. kind=${kind:-server_error}" >&2
+        exit 1
         ;;
     504)
         echo "TIMEOUT: ${msg:-exceeded budget}. Можно попробовать снова." >&2
         exit 1
         ;;
     5*)
-        emit_error "Server error (HTTP $HTTP_CODE, kind=${kind:-server_error}): ${msg:-unknown}"
+        if ! $JSON_OUT || [ -z "$kind" ]; then emit_error "Server error (HTTP $HTTP_CODE, kind=${kind:-server_error}): ${msg:-unknown}"; fi
         exit 1
         ;;
     *)
-        emit_error "Request failed (HTTP $HTTP_CODE, kind=${kind:-unknown}): ${msg:-${BODY_RESP:0:200}}"
+        if ! $JSON_OUT || [ -z "$kind" ]; then emit_error "Request failed (HTTP $HTTP_CODE, kind=${kind:-unknown}): ${msg:-${BODY_RESP:0:200}}"; fi
         exit 1
         ;;
 esac

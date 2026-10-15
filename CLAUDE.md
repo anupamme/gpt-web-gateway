@@ -62,6 +62,17 @@ git diff --cached | grep -nEi \
 
 ## Релиз
 
+С 2.14.11 текстовые запросы принимают `X-Request-Timeout-Ms` (положительное
+целое, максимум и default 1020000 мс). Бюджет включает очередь; disconnect и
+deadline отменяют pending-задания и закрывают страницу активного text-задания.
+До завершения его cleanup очередь не запускает следующее задание. Отмена
+клиентом не увеличивает и не обнуляет infra-failure streak. Чтение DOM текста
+имеет отдельный Node deadline `TEXT_PAGE_POLL_TIMEOUT_MS=10000`, бюджеты
+длительного reasoning сохранены. Контракт и проверки:
+[`docs/2026-10-15-request-cancellation.md`](docs/2026-10-15-request-cancellation.md).
+`chat.sh`: `CHATGPT_WEB_TIMEOUT_SECONDS` задаёт curl timeout и header;
+`--json` сохраняет structured errors, только `login_failed` даёт exit 4.
+
 Helm-чарт лежит здесь (`helm/`), а его values и ArgoCD Application — в приватном
 deploy-репозитории, вне этого проекта. Релиз: бамп `version`/`appVersion` в
 `helm/Chart.yaml` (и `package.json`) + git-тег `v*` → CI собирает и пушит образ в GHCR →

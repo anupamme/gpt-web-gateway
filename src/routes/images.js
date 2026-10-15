@@ -13,6 +13,7 @@ const { isValidConversationId } = require('../lib/conversation-read');
 const { createStreamEmitter } = require('../lib/sse-transform');
 const { progress } = require('../progress');
 const { createPacer } = require('../pacer');
+const { bindRequest } = require('../request-lifecycle');
 const {
   incRequests, incGenerations, incEdits, incError, classifyError, incQueueFull,
   observeDuration, shouldRetryKind,
@@ -162,11 +163,13 @@ function assertNotRateLimited() {
 // send — and stamp the finish whatever happened. The check runs on both sides
 // of the wait on purpose: sitting out 60s only to refuse afterwards makes the
 // caller pay for a send that was never going to happen. Found by agy.
-async function upstreamTurn(send) {
+async function upstreamTurn(send, signal) {
+  signal?.throwIfAborted();
   assertNotRateLimited();
-  const waited = await pacer.gate();
+  const waited = await pacer.gate(signal);
   if (waited > 0) console.log(`[pacer] waited ${Math.round(waited / 1000)}s before an upstream turn`);
   assertNotRateLimited();
+  signal?.throwIfAborted();
   try {
     return await send();
   } finally {
@@ -174,9 +177,26 @@ async function upstreamTurn(send) {
   }
 }
 
-function enqueue(fn) {
+function enqueue(fn, signal) {
   queueSize++;
   progress.jobStarted();
+  let running = false;
+  let accounted = false;
+  const finish = (errorKind) => {
+    if (accounted) return;
+    accounted = true;
+    queueSize--;
+    if (signal?.aborted) progress.jobCancelled();
+    else progress.jobFinished(errorKind);
+  };
+  let rejectCancelled;
+  const cancellation = new Promise((resolve, reject) => { rejectCancelled = reject; });
+  const onAbort = () => {
+    if (!running) finish();
+    rejectCancelled(signal.reason);
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) onAbort();
   // Exactly-once liveness accounting per job: success → streak reset; error → classified
   // kind feeds the consecutive-infra-failure detector (see src/progress.js).
   //
@@ -192,18 +212,28 @@ function enqueue(fn) {
   // try — a gate that rejected outside it would have left the job counted as
   // started and never finished.
   const wrapped = async () => {
+    if (signal?.aborted) { signal.removeEventListener('abort', onAbort); return; }
+    running = true;
     try {
-      const value = await fn();
-      progress.jobFinished(null);
+      const value = await fn(signal);
+      finish(null);
       return value;
     } catch (err) {
-      progress.jobFinished(classifyError(err.message, err.code));
+      finish(classifyError(err.message, err.code));
       throw err;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
     }
   };
-  const p = queue.then(wrapped, wrapped).finally(() => { queueSize--; });
+  const p = queue.then(wrapped, wrapped);
   queue = p.catch(() => {});
-  return p;
+  return signal ? Promise.race([p, cancellation]) : p;
+}
+
+async function enqueueRequest(req, res, fn) {
+  const work = bindRequest(req, res);
+  try { return await enqueue(fn, work.signal); }
+  finally { work.dispose(); }
 }
 
 function elapsedSec(startedAt) {
@@ -264,6 +294,7 @@ function respondWithError(res, startedAt, err) {
   const errorType = classifyError(err.message, err.code);
   incError(errorType);
   observeDuration(errorType, elapsedSec(startedAt));
+  if (res.destroyed || res.writableEnded) return;
 
   if (errorType === 'rate_limit') {
     const retryAfterSec = rateLimitedUntil > Date.now()
@@ -295,6 +326,8 @@ function respondWithError(res, startedAt, err) {
     tier_limit: 503,
     page_load_failed: 503,
     timeout: 504,
+    request_timeout: 504,
+    invalid_request: 400,
     server_error: 500,
   };
   const status = statusByKind[errorType] || 500;
@@ -873,14 +906,15 @@ async function handleTextCompletion(req, res, prompt) {
   if (checkQueueFull(res, startedAt)) return;
 
   if (stream) {
-    return streamTextCompletion(res, prompt, { thinkingMode, webSearch, conversationId, startedAt });
+    return streamTextCompletion(req, res, prompt, { thinkingMode, webSearch, conversationId, startedAt });
   }
 
   try {
-    const result = await enqueue(() => upstreamTurn(() => completeText(prompt, {
+    const result = await enqueueRequest(req, res, (signal) => upstreamTurn(() => completeText(prompt, {
       thinkingMode,
       conversationId,
-    })));
+      signal,
+    }), signal));
 
     const applied = result.applied || { thinking: false, thinking_mode: 'instant' };
     progress.clearPartialInfra(); // any full success proves the session alive
@@ -952,7 +986,7 @@ function textEcho(applied, thinkingMode, webSearch) {
 // SSE streaming leg of a text completion. Headers are sent lazily on the first delta
 // (or at completion), so queue-full / rate-limit / pre-flight errors above still go
 // out as plain JSON. Once the stream started, errors become an SSE error event.
-async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conversationId, startedAt }) {
+async function streamTextCompletion(req, res, prompt, { thinkingMode, webSearch, conversationId, startedAt }) {
   const meta = { id: `chatcmpl-${randomUUID()}`, created: Math.floor(Date.now() / 1000), model: 'chatgpt-web' };
   const emitter = createStreamEmitter(meta);
   let streamingStarted = false;
@@ -971,9 +1005,10 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
   };
 
   try {
-    const result = await enqueue(() => upstreamTurn(() => completeText(prompt, {
+    const result = await enqueueRequest(req, res, (signal) => upstreamTurn(() => completeText(prompt, {
       thinkingMode,
       conversationId,
+      signal,
       // Called with the latest FULL text; the emitter turns it into append-only deltas.
       onDelta: (fullText) => {
         try {
@@ -981,7 +1016,7 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
           for (const chunk of emitter.push(fullText)) res.write(chunk);
         } catch {}
       },
-    })));
+    }), signal));
 
     ensureStreamStarted();
     for (const chunk of emitter.finish(result.text, {
@@ -995,6 +1030,7 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
     observeDuration('success', elapsedSec(startedAt));
   } catch (err) {
     console.error('Streaming completion error:', err.message);
+    if (res.destroyed || res.writableEnded) return;
     if (!streamingStarted) return respondWithError(res, startedAt, err);
     // Headers are gone — emit an OpenAI-style terminal error event instead.
     handleRateLimitError(err);

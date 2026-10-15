@@ -224,6 +224,21 @@ active, and the DOM-only fallback path).
 
 ### Error format
 
+Text requests (`/v1/chat/completions`, `/v1/responses`, including SSE) accept
+`X-Request-Timeout-Ms`, a positive integer capped at 1,020,000 ms; the default
+is the same cap. The budget includes queue wait. Expired pending requests are
+discarded; active text requests cancel their browser page when the client
+disconnects or the budget expires. Deadline responses use HTTP 504 and
+`error_kind: "request_timeout"`. Browser cleanup retains the queue slot until
+it settles, preventing overlap with the next request. Individual text page
+reads also have a Node-side deadline, independent of the renderer.
+
+The bundled `chat.sh` accepts `CHATGPT_WEB_TIMEOUT_SECONDS` (default `1020`)
+and sends the corresponding header alongside curl's transport timeout. With
+`--json`, non-2xx responses preserve the service's `error_kind`, `should_retry`,
+and `error.retry_after`; only explicit `login_failed` uses exit code 4.
+See the [request cancellation notes](docs/2026-10-15-request-cancellation.md).
+
 Every endpoint returns a uniform error shape:
 
 ```json
@@ -291,6 +306,7 @@ Every endpoint returns a uniform error shape:
 | `TIER_UNAVAILABLE_COOLDOWN_SEC` | How long a tier proven unavailable is skipped outright. Cleared early on a successful selection. `0` = re-probe every request | `900` |
 | `CHAT_COMPLETION_RETRY_TIMEOUT_SEC` | One-time adaptive extension for text, granted only while the model is visibly streaming/thinking. Cluster runs **180** | `120` |
 | `CHAT_STALL_WINDOW_SEC` | Stuck-guard: extensions require page/text change within the last N s (×2 for thinking modes). A frozen page with a stop button is not "live" | `120` |
+| `TEXT_PAGE_POLL_TIMEOUT_MS` | Node-side deadline for an individual text page read; discards an unresponsive page without shortening valid model reasoning budgets | `10000` |
 | `CHAT_STREAM_RESCUE_SEC` | Grace window to rescue a response that is still streaming at the deadline | `60` |
 | `CHATGPT_TEXT_RETRY_ATTEMPTS` | Attempts for `page_load_failed` transients (fresh page → full browser rebuild) | `4` |
 | `CHATGPT_TEXT_HARD_RESET` | Allow full browser-context rebuild on repeated `page_load_failed` (auto-off in `cdp` mode) | `true` |
