@@ -278,7 +278,7 @@ function conversationIdFromUrl(url) {
 // Passive listener: GET conversation JSON (rendered after reloads / conversation opens)
 // and finished SSE bodies (authoritative once the stream closed — merged into the live
 // capture in case the injected tee missed chunks).
-function onBackendResponse(slot, response) {
+function onBackendResponse(slot, p, response) {
   return (async () => {
     let pathname;
     try {
@@ -294,6 +294,8 @@ function onBackendResponse(slot, response) {
     slot.backendResponses.push({ at, method, path: pathname.replace(
       /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,}/gi, '<id>'), status, ct });
     if (slot.backendResponses.length > 30) slot.backendResponses.shift();
+    // A closing page can still emit responses after this slot has been reused.
+    if (p !== slot.page) return;
     // Snapshot before any await: a late body belongs to this turn, even if a
     // different capture is active when the body eventually arrives.
     const cap = activeCapture(slot);
@@ -303,6 +305,7 @@ function onBackendResponse(slot, response) {
         return;
       }
       const data = await response.json().catch(() => null);
+      if (p !== slot.page) return;
       if (cap) {
         const nodes = Object.values(data?.mapping || {});
         const last = data?.mapping?.[data.current_node]?.message
@@ -332,6 +335,7 @@ function onBackendResponse(slot, response) {
             new Promise(resolve => { timer = setTimeout(() => resolve(null), 5000); }),
           ]);
         } catch {} finally { clearTimeout(timer); }
+        if (p !== slot.page) return;
         if (body !== null) failure.snippet = String(body).replace(/\s+/g, ' ').trim().slice(0, 300);
         console.log(`[backend-read] slot=${slot.id} conversation POST status=${status} ct=${ct} body=${body === null ? '<unread>' : JSON.stringify(failure.snippet)}`);
         return;
@@ -341,7 +345,7 @@ function onBackendResponse(slot, response) {
       // stream ends — by then a NEW turn's capture may be current. Merging into the
       // snapshot keeps a late body from bleeding into the wrong turn (Codex P1).
       const body = await response.text().catch(() => null);
-      if (body) cap.merge(parseSseBody(body));
+      if (p === slot.page && body) cap.merge(parseSseBody(body));
     }
   })().catch(() => {});
 }
@@ -516,7 +520,7 @@ function acceptSseChunk(slot, streamId, chunk) {
 
 async function setupBackendReadHooks(p, slot = getSlot(0)) {
   if (!READ_VIA_BACKEND_API) return;
-  p.on('response', (response) => onBackendResponse(slot, response));
+  p.on('response', (response) => onBackendResponse(slot, p, response));
   await p.exposeFunction('__gwgSseChunk', (streamId, chunk) => {
     acceptSseChunk(slot, streamId, chunk);
   });
@@ -1551,6 +1555,7 @@ async function removePendingAttachments(p) {
 }
 
 let snapshotSequence = 0;
+let stallSnapshotQueue = Promise.resolve();
 function pruneStallSnapshots() {
   const pairs = new Map();
   for (const name of fs.readdirSync(DEBUG_SNAPSHOT_DIR)) {
@@ -1571,18 +1576,25 @@ function pruneStallSnapshots() {
 async function saveDebugSnapshot(p, label) {
   const stall = label === 'text_rescue' || label === 'text_stalled';
   if (stall ? !STALL_SNAPSHOTS_ENABLED : !DEBUG_SNAPSHOTS_ENABLED) return;
-  try {
-    fs.mkdirSync(DEBUG_SNAPSHOT_DIR, { recursive: true });
-    const ts = new Date(Date.now()).toISOString().replace(/[:.]/g, '-');
-    const base = `${DEBUG_SNAPSHOT_DIR}/${ts}_s${slotOf(p).id}_${++snapshotSequence}_${label}`;
-    await p.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => {});
-    const html = await p.content().catch(() => '');
-    if (html) fs.writeFileSync(`${base}.html`, html);
-    if (stall) pruneStallSnapshots();
-    console.log(`[debug] Snapshot saved: ${base}.{png,html}`);
-  } catch (e) {
-    console.log('[debug] Snapshot failed:', e.message);
-  }
+  const save = async () => {
+    try {
+      fs.mkdirSync(DEBUG_SNAPSHOT_DIR, { recursive: true });
+      const ts = new Date(Date.now()).toISOString().replace(/[:.]/g, '-');
+      const base = `${DEBUG_SNAPSHOT_DIR}/${ts}_s${slotOf(p).id}_${++snapshotSequence}_${label}`;
+      await raceDeadline(p.screenshot({ path: `${base}.png`, fullPage: true }), 5000).catch(() => {});
+      const html = await raceDeadline(p.content(), 5000).catch(() => '');
+      if (typeof html === 'string' && html) fs.writeFileSync(`${base}.html`, html);
+      if (stall) pruneStallSnapshots();
+      console.log(`[debug] Snapshot saved: ${base}.{png,html}`);
+    } catch (e) {
+      console.log('[debug] Snapshot failed:', e.message);
+    }
+  };
+  if (!stall) return save();
+  // Keep both files and retention in one critical section across all slots.
+  const pending = stallSnapshotQueue.then(save);
+  stallSnapshotQueue = pending.catch(() => {});
+  return pending;
 }
 
 async function captureConversationState(p) {
@@ -2699,6 +2711,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   let submitted = false;
   while (Date.now() < submitDeadline) {
     throwBackendPostFailure(capture, onSubmitted);
+    if (capture?.postAccepted) { submitted = true; break; }
     const turnsNow = await countUserTurns();
     if (userTurnsBefore >= 0 && turnsNow > userTurnsBefore) { submitted = true; break; }
     const composerNow = normText(await readComposerText(textareaLocator.first()).catch(() => ''));
@@ -2711,6 +2724,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     await p.waitForTimeout(500).catch(() => {});
   }
   throwBackendPostFailure(capture, onSubmitted);
+  if (capture?.postAccepted) submitted = true;
   if (!submitted) {
     markSessionDegraded('prompt submit not confirmed in 12s', slotOf(p));
     await saveDebugSnapshot(p, 'submit_unconfirmed').catch(() => {});
@@ -2722,7 +2736,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     if (uiError) err.modelMessage = uiError;
     throw err;
   }
-  console.log('Prompt submitted (confirmed).');
+  console.log(capture?.postAccepted ? 'Prompt submitted (confirmed) by backend POST.' : 'Prompt submitted (confirmed).');
   // Signal confirmed-send NOW, before the settle wait — a failure during the wait below must
   // count as "already submitted" so the caller does not retry and resubmit the prompt.
   if (onSubmitted) { try { onSubmitted(); } catch {} }

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Confirm text submission from accepted backend POSTs even when the DOM stalls;
+  ignore responses from replaced pages. Bound snapshot reads and serialize stall
+  snapshot saves with retention; cover late diagnostic bodies across turns.
 - Diagnose backend conversation POST/GET responses per slot, fail promptly on
   rejected POSTs, and log recent backend traffic on rescue/stall. Stall snapshots
   are enabled separately from debug snapshots and retained with a bounded history.

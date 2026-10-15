@@ -172,6 +172,22 @@ test('unread POST body has a bounded single diagnostic and cannot contaminate a 
   });
 });
 
+test('a POST body resolved after capture B opens writes its snippet only to capture A', async () => {
+  await fixture({}, async ({ chat, page, queue }) => {
+    const p = page(); queue.push(p); const slot = chat.getSlot(2); await chat.getPage(slot);
+    const first = chat._test.beginBackendCapture(slot);
+    let finish;
+    const body = new Promise(resolve => { finish = resolve; });
+    p.emit('response', response({ status: 429, ct: 'application/json', text: () => body }));
+    assert.equal(first.postFailure.status, 429);
+    const next = chat._test.beginBackendCapture(slot);
+    finish('  delayed\n rejection  ');
+    await flush();
+    assert.equal(first.postFailure.snippet, 'delayed rejection');
+    assert.equal(next.postFailure, undefined);
+  });
+});
+
 test('non-SSE diagnostics normalize and truncate body, 5xx rejects, 2xx keeps waiting', async () => {
   await fixture({}, async ({ chat, page, queue, clock }) => {
     const p = page(); queue.push(p); const slot = chat.getSlot(0); await chat.getPage(slot);
