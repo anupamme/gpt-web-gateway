@@ -44,8 +44,27 @@ function createJobPool({ concurrency, maxWaiting }) {
   // sinceEpoch is older than that already missed a finished pass.
   const nameDoneEpoch = new Map();
 
+  function maintenancePending() {
+    return activeMaintenance !== null || maintenanceQueue.length > 0;
+  }
+
+  // A held retry still owns its conversation: a later job of the same key must
+  // not start in front of it. pump() does not start jobs during maintenance;
+  // this check covers the window where the hold is the only thing in the way.
   function keyIsBusy(key) {
-    return slots.some((slot) => slot.busy && slot.key === key);
+    if (slots.some((slot) => slot.busy && slot.key === key)) return true;
+    return waiting.some((job) => (
+      job.key === key && job.holdEpoch !== undefined && epoch <= job.holdEpoch
+    ));
+  }
+
+  // maxWaiting counts jobs that are actually waiting. A job that can take a
+  // free slot right now is not one of them, even when maxWaiting is 0.
+  function canAdmitImmediately(key) {
+    if (maintenancePending()) return false;
+    if (running >= concurrency) return false;
+    if (key != null && keyIsBusy(key)) return false;
+    return true;
   }
 
   function takeNextEligible() {
@@ -149,7 +168,9 @@ function createJobPool({ concurrency, maxWaiting }) {
     const error = outcome.ok ? null : outcome.error;
     if (error && error.retryAfterMaintenance === true && job.returned !== true) {
       job.returned = true;
-      job.holdEpoch = epoch;
+      // Hold only when a reset is already pending or active. A marker thrown
+      // with nothing requested must retry at once, or it waits forever.
+      if (maintenancePending()) job.holdEpoch = epoch;
       waiting.unshift(job);
     } else if (outcome.ok) {
       job.resolve(outcome.value);
@@ -188,7 +209,8 @@ function createJobPool({ concurrency, maxWaiting }) {
   }
 
   function submit(fn, { key } = {}) {
-    if (limitedWaiting >= maxWaiting) {
+    const normalizedKey = key == null ? null : key;
+    if (!canAdmitImmediately(normalizedKey) && limitedWaiting >= maxWaiting) {
       const err = new Error('queue full');
       err.code = 'queue_full';
       throw err;
@@ -202,7 +224,7 @@ function createJobPool({ concurrency, maxWaiting }) {
     limitedWaiting += 1;
     waiting.push({
       fn,
-      key: key == null ? null : key,
+      key: normalizedKey,
       limited: true,
       returned: false,
       resolve,
@@ -213,6 +235,7 @@ function createJobPool({ concurrency, maxWaiting }) {
   }
 
   function isFull() {
+    if (canAdmitImmediately(null)) return false;
     return limitedWaiting >= maxWaiting;
   }
 

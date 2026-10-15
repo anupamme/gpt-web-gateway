@@ -69,11 +69,17 @@ add('an unrelated failure arms nothing', () => {
   assert.strictEqual(getRateLimitedUntil(), 0);
 });
 
-add('the queue-full estimate counts a gap per queued job', () => {
+add('the queue-full estimate counts a gap per concurrency slice of waiters', () => {
+  // Default concurrency is 3 and the default gap is 60s. Waiting jobs share
+  // the slots, so one slice of the pool is one gap: 1 and 3 waiters cost 60s,
+  // 4 waiters cost 120s. The empty queue is the base Retry-After only.
   const empty = queueFullRetryAfterSec(0);
-  const five = queueFullRetryAfterSec(5);
-  assert.ok(five > empty, 'a longer queue must quote a longer wait');
-  assert.strictEqual(five - empty, 5 * 60, 'five jobs at the default 60s gap');
+  const one = queueFullRetryAfterSec(1);
+  const three = queueFullRetryAfterSec(3);
+  const four = queueFullRetryAfterSec(4);
+  assert.strictEqual(one - empty, 60, 'one waiter costs one gap');
+  assert.strictEqual(three - empty, 60, 'a full slice of concurrency still costs one gap');
+  assert.strictEqual(four - empty, 2 * 60, 'one waiter past a slice costs a second gap');
 });
 
 add('the queue-full estimate is always whole seconds', () => {

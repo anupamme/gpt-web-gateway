@@ -1,6 +1,6 @@
 // Fake-clock tests for src/progress.js — the /health/live stuck detectors.
 const assert = require('assert');
-const { createProgress } = require('../src/progress');
+const { createProgress, HEALTH_STUCK_MS } = require('../src/progress');
 
 let passed = 0;
 function ok(name, fn) { fn(); console.log(`PASS: ${name}`); passed++; }
@@ -97,6 +97,73 @@ ok('jobFinished drops the job so it no longer fails liveness', () => {
   assert.strictEqual(p.liveness().alive, true);
   assert.strictEqual(p.snapshot().running_jobs, 0);
   assert.strictEqual(p.snapshot().oldest_job_ms_since_progress, null);
+});
+
+ok('a stuck job is reported before a stuck queue', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobStarted();
+  p.jobRunning('a');
+  clock.advance(HEALTH_STUCK_MS + 1);
+  const verdict = p.liveness();
+  assert.strictEqual(verdict.alive, false);
+  assert.match(verdict.reason, /^job a\b/);
+});
+
+ok('touch of an unknown id does not create a running job', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.touch('ghost');
+  clock.advance(HEALTH_STUCK_MS + 1);
+  assert.strictEqual(p.snapshot().running_jobs, 0);
+  assert.strictEqual(p.liveness().alive, true);
+});
+
+ok('jobFinished without an id keeps other running jobs', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobRunning('a');
+  clock.advance(HEALTH_STUCK_MS + 1);
+  p.jobFinished(null);
+  assert.strictEqual(p.snapshot().running_jobs, 1);
+  const verdict = p.liveness();
+  assert.strictEqual(verdict.alive, false);
+  assert.match(verdict.reason, /job a/);
+});
+
+ok('a job at exactly the stuck threshold is still alive', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobRunning('a');
+  clock.advance(HEALTH_STUCK_MS);
+  assert.strictEqual(p.liveness().alive, true);
+  assert.strictEqual(p.liveness().reason, 'ok');
+});
+
+ok('queued work at exactly the stuck threshold is still alive', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobStarted();
+  clock.advance(HEALTH_STUCK_MS);
+  assert.strictEqual(p.liveness().alive, true);
+  assert.strictEqual(p.liveness().reason, 'ok');
+});
+
+ok('jobRequeued drops the running id without touching the queue or streaks', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobStarted();
+  p.jobRunning('a');
+  p.jobStarted();
+  p.jobFinished('timeout');
+  const before = p.snapshot();
+  p.jobRequeued('a');
+  const after = p.snapshot();
+  assert.strictEqual(after.running_jobs, 0);
+  assert.strictEqual(after.queue_size, before.queue_size);
+  assert.strictEqual(after.queue_size, 1);
+  assert.strictEqual(after.consecutive_infra_failures, before.consecutive_infra_failures);
+  assert.strictEqual(after.consecutive_infra_failures, 1);
 });
 
 ok('touch() and jobStarted() keep the previous liveness contract', () => {

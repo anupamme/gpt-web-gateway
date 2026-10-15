@@ -164,31 +164,96 @@ const DISABLE_CHATGPT_MEMORY = envFlag('DISABLE_CHATGPT_MEMORY');
 // PATCH /backend-api/settings/account_user_setting?feature=<f>&value=false
 const MEMORY_DISABLE_FEATURES = ['hive_referenced_in_internal_knowledge', 'sunshine'];
 
-let page = null;
+// One browser tab per pool slot. Capture, recovery and the page itself live on the
+// slot: a chunk or a conversation id from tab A must not land in tab B. Playwright
+// events arrive outside the job's async context, so the slot is closed over by the
+// page hooks rather than read from ambient storage.
+const slotsById = new Map();
+const pageToSlot = new WeakMap();
 
-// ==== Backend-api passive reading (READ_VIA_BACKEND_API=1) ====
-// One capture per text turn: completeText() calls beginBackendCapture() before submit;
-// the page-level hooks below feed everything that looks like the current answer into it.
-let currentCapture = null;          // SseAccumulator | null (+ .boundStream)
-let lastConversationFetch = null;   // { conversationId, lastAssistantText, isComplete, at }
-// Stream ids seen outside any capture, or consumed by an ended capture. A late chunk
-// from a PREVIOUS turn's SSE stream must never bind to (and pollute) the next turn's
-// capture — cross-request answer/conversation_id bleed (Codex P1).
-const staleStreams = new Set();
-
-function beginBackendCapture() {
-  if (!READ_VIA_BACKEND_API) return null;
-  currentCapture = new SseAccumulator();
-  // First fresh (non-stale) stream observed after this point becomes THE stream of
-  // this turn; chunks from any other stream id are ignored.
-  currentCapture.boundStream = null;
-  return currentCapture;
+function createSlot(id) {
+  return {
+    id,
+    page: null,
+    pagePromise: null,
+    jobId: undefined,
+    epoch: undefined,
+    capture: null,
+    lastConversationFetch: null,
+    staleStreams: new Set(),
+    recoveryState: 'healthy',
+    pendingReset: null,
+    menuFailures: 0,
+  };
 }
 
-function endBackendCapture() {
-  if (currentCapture && currentCapture.boundStream) staleStreams.add(currentCapture.boundStream);
-  if (staleStreams.size > 500) staleStreams.clear(); // unbounded-growth guard
-  currentCapture = null;
+function getSlot(id) {
+  const slotId = Number.isInteger(id) ? id : 0;
+  let slot = slotsById.get(slotId);
+  if (!slot) {
+    slot = createSlot(slotId);
+    slotsById.set(slotId, slot);
+  }
+  return slot;
+}
+
+// Fake pages used by the unit tests are never bound. They share slot 0, which is
+// what the old module globals were: one capture, one menu-failure streak.
+function slotOf(page) {
+  if (page && pageToSlot.has(page)) return pageToSlot.get(page);
+  return getSlot(0);
+}
+
+function jobFromOptions(options) {
+  const job = options && options.job;
+  if (!job) return { slotId: 0, jobId: undefined, epoch: undefined };
+  return {
+    slotId: Number.isInteger(job.slotId) ? job.slotId : 0,
+    jobId: job.jobId,
+    epoch: job.epoch,
+  };
+}
+
+function adoptJob(options) {
+  const job = jobFromOptions(options);
+  const slot = getSlot(job.slotId);
+  slot.jobId = job.jobId;
+  slot.epoch = job.epoch;
+  return slot;
+}
+
+function bindPage(slot, p) {
+  slot.page = p;
+  if (p) pageToSlot.set(p, slot);
+  return p;
+}
+
+// ==== Backend-api passive reading (READ_VIA_BACKEND_API=1) ====
+// One capture per text turn on THIS slot. completeText() calls beginBackendCapture
+// before submit; the page-level hooks below feed that slot's capture only.
+
+function activeCapture(slot) {
+  return slot.capture;
+}
+
+function rememberConversation(slot, snap) {
+  slot.lastConversationFetch = { ...snap, at: Date.now() };
+}
+
+function beginBackendCapture(slot = getSlot(0)) {
+  if (!READ_VIA_BACKEND_API) return null;
+  slot.capture = new SseAccumulator();
+  // First fresh (non-stale) stream observed after this point becomes THE stream of
+  // this turn; chunks from any other stream id are ignored.
+  slot.capture.boundStream = null;
+  return slot.capture;
+}
+
+function endBackendCapture(slot = getSlot(0)) {
+  const cap = slot.capture;
+  if (cap && cap.boundStream) slot.staleStreams.add(cap.boundStream);
+  if (slot.staleStreams.size > 500) slot.staleStreams.clear(); // unbounded-growth guard
+  slot.capture = null;
 }
 
 const SINGLE_CONVERSATION_PATH_RE = /^\/backend-api\/conversation\/[0-9a-f-]+$/i;
@@ -202,7 +267,7 @@ function conversationIdFromUrl(url) {
 // Passive listener: GET conversation JSON (rendered after reloads / conversation opens)
 // and finished SSE bodies (authoritative once the stream closed — merged into the live
 // capture in case the injected tee missed chunks).
-function onBackendResponse(response) {
+function onBackendResponse(slot, response) {
   (async () => {
     let pathname;
     try {
@@ -217,7 +282,7 @@ function onBackendResponse(response) {
       const data = await response.json().catch(() => null);
       const snap = data ? extractAssistantFromMapping(data) : null;
       if (snap && snap.lastAssistantText) {
-        lastConversationFetch = { ...snap, at: Date.now() };
+        rememberConversation(slot, snap);
       }
       return;
     }
@@ -228,7 +293,7 @@ function onBackendResponse(response) {
       // headers arrive (inside the right turn), but text() resolves only when the
       // stream ends — by then a NEW turn's capture may be current. Merging into the
       // snapshot keeps a late body from bleeding into the wrong turn (Codex P1).
-      const cap = currentCapture;
+      const cap = activeCapture(slot);
       if (!cap) return;
       const body = await response.text().catch(() => null);
       if (body) cap.merge(parseSseBody(body));
@@ -370,23 +435,27 @@ async function setupConversationTrim(ctx) {
   console.log(`[trim] conversation trim enabled (CONVERSATION_TRIM_LIMIT=${CONVERSATION_TRIM_LIMIT})`);
 }
 
-async function setupBackendReadHooks(p) {
+function acceptSseChunk(slot, streamId, chunk) {
+  if (typeof streamId !== 'string' || typeof chunk !== 'string') return;
+  const cap = activeCapture(slot);
+  if (!cap) {
+    // No turn in flight — remember the stream so it can never bind later.
+    slot.staleStreams.add(streamId);
+    return;
+  }
+  if (cap.boundStream === null) {
+    if (slot.staleStreams.has(streamId)) return; // stream predates this capture
+    cap.boundStream = streamId;
+  }
+  if (cap.boundStream !== streamId) return;
+  try { cap.feed(chunk); } catch {}
+}
+
+async function setupBackendReadHooks(p, slot = getSlot(0)) {
   if (!READ_VIA_BACKEND_API) return;
-  p.on('response', onBackendResponse);
+  p.on('response', (response) => onBackendResponse(slot, response));
   await p.exposeFunction('__gwgSseChunk', (streamId, chunk) => {
-    if (typeof streamId !== 'string' || typeof chunk !== 'string') return;
-    const cap = currentCapture;
-    if (!cap) {
-      // No turn in flight — remember the stream so it can never bind later.
-      staleStreams.add(streamId);
-      return;
-    }
-    if (cap.boundStream === null) {
-      if (staleStreams.has(streamId)) return; // stream predates this capture
-      cap.boundStream = streamId;
-    }
-    if (cap.boundStream !== streamId) return;
-    try { cap.feed(chunk); } catch {}
+    acceptSseChunk(slot, streamId, chunk);
   });
   await p.addInitScript(backendFetchTeeInitScript);
   // Every fresh document needs its main world touched once, or the tee above can never reach
@@ -455,21 +524,19 @@ async function primeMainWorld(p) {
   }
 }
 
-// Single-flight guard (same rationale as browser.js getContext): startup warm-up and the
-// first request can both reach getPage() with `page` still null and would otherwise each
-// create a page and overwrite the singleton. Memoize the in-flight creation.
-let pagePromise = null;
-async function getPage() {
-  if (page && !page.isClosed()) {
-    await recoverContentFailed(page);
-    return page;
+// Single-flight guard per slot (same rationale as browser.js getContext): two callers
+// of one slot must not each create a page. Different slots create different pages.
+async function getPage(slot = getSlot(0)) {
+  if (slot.page && !slot.page.isClosed()) {
+    await recoverContentFailed(slot.page);
+    return slot.page;
   }
-  if (pagePromise) return pagePromise;
-  pagePromise = _createPage();
+  if (slot.pagePromise) return slot.pagePromise;
+  slot.pagePromise = _createPage(slot);
   try {
-    return await pagePromise;
+    return await slot.pagePromise;
   } finally {
-    pagePromise = null;
+    slot.pagePromise = null;
   }
 }
 
@@ -579,8 +646,8 @@ async function reportCloudflareBlock(p, navResponse) {
   return facts;
 }
 
-async function _createPage() {
-  if (page && !page.isClosed()) return page;
+async function _createPage(slot = getSlot(0)) {
+  if (slot.page && !slot.page.isClosed()) return slot.page;
 
   const ctx = await getContext();
   await setupConversationTrim(ctx);
@@ -598,7 +665,7 @@ async function _createPage() {
   // Hide automation — legacy engine only; patchright reports webdriver=false natively.
   await maybeHideWebdriverOnPage(p);
 
-  await setupBackendReadHooks(p);
+  await setupBackendReadHooks(p, slot);
 
   // Navigation is RETRIED on a Cloudflare challenge, because that verdict is decided per
   // navigation: the same address that is challenged now is served 200 on a fresh `goto` a
@@ -810,9 +877,9 @@ async function _createPage() {
   }
 
   await saveSession();
-  page = p; // publish only after full init AND session save succeed
+  bindPage(slot, p); // publish only after full init AND session save succeed
   published = true;
-  return page;
+  return p;
   } finally {
     if (!published) await p.close().catch(() => {});
   }
@@ -827,7 +894,11 @@ function closeWedgedPage(p) {
   try {
     if (p && (!p.isClosed || !p.isClosed())) p.close().catch(() => {});
   } catch {}
-  if (p === page) page = null;
+  const owner = p && pageToSlot.get(p);
+  if (owner && owner.page === p) {
+    owner.page = null;
+    pageToSlot.delete(p);
+  }
 }
 
 // Race a promise against a wall-clock deadline that lives in NODE, not in the page.
@@ -943,7 +1014,7 @@ async function probeSessionState(p, opts = {}) {
       // rejects the orphaned evaluate, guarantees the next getPage() builds a fresh one,
       // and stops ticks from stacking up hung calls (Codex review).
       console.log('[session] session probe hit its Node-side deadline — renderer wedged, discarding the page');
-      markSessionDegraded('session probe deadline');
+      markSessionDegraded('session probe deadline', slotOf(p));
       closeWedgedPage(p);
       // No DOM fallback: the page we would ask is the one we just threw away.
       return 'unknown';
@@ -987,14 +1058,18 @@ async function probeSessionState(p, opts = {}) {
  * (Codex review). Waiting is cheap next to the page-creation budget we are about to spend.
  */
 async function recreatePage(stale) {
-  if (page === stale) page = null;
+  const slot = slotOf(stale);
+  if (slot.page === stale) {
+    slot.page = null;
+    if (stale) pageToSlot.delete(stale);
+  }
   if (stale && !stale.isClosed()) {
     // Bounded: this runs on the path that handles pages which are ALREADY misbehaving, and
     // close() on a wedged renderer can hang indefinitely (agy review). Waiting is worth a
     // few seconds to avoid an overlapping teardown; it is never worth the request.
     await raceDeadline(stale.close().catch(() => {}), PAGE_CLOSE_DEADLINE_MS);
   }
-  const fresh = await getPage();
+  const fresh = await getPage(slot);
   await dismissModals(fresh);
   return fresh;
 }
@@ -1100,45 +1175,51 @@ async function recoverContentFailed(p, { deadline } = {}) {
 // Probation ends ONLY on a verified-healthy completion (markHealthyCompletion) — not
 // merely on the next request arriving, which used to let repeated menu-fails ping-pong
 // on page resets forever without ever escalating.
-let recoveryState = 'healthy'; // 'healthy' | 'probation'
-let pendingReset = null;       // null | 'page' | 'hard'
-let consecutiveMenuFailures = 0;
-
-function markSessionDegraded(reason) {
-  pendingReset = recoveryState === 'probation' ? 'hard' : 'page';
-  console.log(`[recovery] session degraded (${reason}) — ${pendingReset} reset pending`);
+function markSessionDegraded(reason, slot = null) {
+  const target = slot || getSlot(0);
+  target.pendingReset = target.recoveryState === 'probation' ? 'hard' : 'page';
+  console.log(`[recovery] session degraded (${reason}) — ${target.pendingReset} reset pending`);
 }
 
 // Drop a pending reset that has already been satisfied by a rebuild we just did ourselves.
 // Only ever called after a CONFIRMED-live probe on the fresh page, so this cannot swallow a
 // degradation that still needs acting on.
-function consumePendingReset(reason) {
-  if (!pendingReset) return;
-  console.log(`[recovery] dropping the pending ${pendingReset} reset — ${reason}`);
-  pendingReset = null;
+function consumePendingReset(slot, reason) {
+  const target = slot || getSlot(0);
+  if (!target.pendingReset) return;
+  console.log(`[recovery] dropping the pending ${target.pendingReset} reset — ${reason}`);
+  target.pendingReset = null;
 }
 
-// A fully healthy op (verified level switch or clean completion) ends probation.
-function markHealthyCompletion() {
-  if (recoveryState !== 'healthy') console.log('[recovery] healthy completion — probation over');
-  recoveryState = 'healthy';
-  consecutiveMenuFailures = 0;
+// A fully healthy op (verified level switch or clean completion) ends probation
+// on THIS slot only. Slot B recovering must not clear slot A's probation.
+function markHealthyCompletion(slot = getSlot(0)) {
+  const target = slot;
+  if (target.recoveryState !== 'healthy') console.log('[recovery] healthy completion — probation over');
+  target.recoveryState = 'healthy';
+  target.menuFailures = 0;
 }
 
 // Called at the start of every operation, BEFORE ensureLoggedIn (getPage recreates the page).
-async function maybeRecoverSession() {
-  if (!pendingReset) return;
-  const kind = pendingReset;
-  pendingReset = null;
+// A page reset touches only this slot. A hard reset is maintenance: it cannot run
+// while this job still holds the slot, so the job is handed back to the pool.
+async function maybeRecoverSession(slot = getSlot(0)) {
+  if (!slot.pendingReset) return;
+  const kind = slot.pendingReset;
+  slot.pendingReset = null;
   if (kind === 'hard') {
     console.log('[recovery] degradation during probation — hard browser reset');
-    await hardResetBrowser().catch((e) => console.log('[recovery] hard reset failed:', e.message));
-    recoveryState = 'probation'; // still on probation until a healthy completion
+    slot.recoveryState = 'probation';
+    await runOrDefer('hard-reset', () => hardResetBrowser(), slot, {
+      exclusive: false,
+      code: 'page_load_failed',
+      message: 'session degraded during probation — hard reset requested',
+    });
     return;
   }
   console.log('[recovery] consuming pending page reset (entering probation)');
-  recoveryState = 'probation';
-  resetPage();
+  slot.recoveryState = 'probation';
+  resetPage(slot);
 }
 
 // Work-onboarding overlay (rolled out with the Pro/Work update, 2026-07-10): a dialog with
@@ -1214,7 +1295,7 @@ async function ensureChatMode(p) {
     const looksWork = PILL_MODEL_PREFIX.test((pillNow || '').trim());
     console.log(`[ui-adapter] Chat/Work switcher: forced Chat (workActive=${seg.workActive}, pill now "${(pillNow || '').trim()}"${looksWork ? ' — STILL LOOKS LIKE WORK' : ''})`);
     if (looksWork) {
-      markSessionDegraded('still on Work surface after forced Chat switch');
+      markSessionDegraded('still on Work surface after forced Chat switch', slotOf(p));
       const err = new Error('Could not switch composer from Work to Chat');
       err.code = 'page_load_failed';
       throw err;
@@ -1541,14 +1622,15 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       }
       // Post-reload path (stream-rescue): the conversation GET carries the finished
       // answer. Only trust a fetch made during THIS turn with genuinely new text.
-      if (lastConversationFetch && lastConversationFetch.at >= start
-          && lastConversationFetch.isComplete && lastConversationFetch.lastAssistantText
-          && lastConversationFetch.lastAssistantText !== (beforeState.lastAssistantText || '')) {
+      const fetched = slotOf(p).lastConversationFetch;
+      if (fetched && fetched.at >= start
+          && fetched.isComplete && fetched.lastAssistantText
+          && fetched.lastAssistantText !== (beforeState.lastAssistantText || '')) {
         console.log('[backend-read] answer taken from conversation fetch after reload');
-        emitDelta(lastConversationFetch.lastAssistantText);
+        emitDelta(fetched.lastAssistantText);
         return {
-          text: lastConversationFetch.lastAssistantText,
-          conversationId: lastConversationFetch.conversationId || conversationIdFromUrl(p.url()),
+          text: fetched.lastAssistantText,
+          conversationId: fetched.conversationId || conversationIdFromUrl(p.url()),
         };
       }
     }
@@ -1557,7 +1639,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     if (state) {
       // Successful page poll = the browser event loop is alive — feed /health/live so a
       // long legitimate wait is never mistaken for a wedged process.
-      liveness.touch();
+      liveness.touch(slotOf(p).jobId);
       const snapshot = `${state.assistantCount}\u0000${state.lastAssistantText}\u0000${state.bodyTail}`;
       if (snapshot !== lastSnapshot) {
         lastSnapshot = snapshot;
@@ -1597,7 +1679,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
           seen: beforeState.bodyTail,
         });
         if (limit) {
-          tierAvailability.noteUnavailable(limit.tier, 'quota-banner', { stickyAfter: 1 });
+          tierAvailability.noteUnavailable(limit.tier, 'quota-banner', { stickyAfter: 1, slotId: slotOf(p).id });
           await saveDebugSnapshot(p, 'tier_limit').catch(() => {});
           const err = new Error(`ChatGPT reported the ${limit.tier} tier limit for this account`);
           err.code = 'tier_limit';
@@ -1670,7 +1752,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     // frozen page. No observable change for a whole stall window AND no candidate answer
     // yet → the session is degraded; fail fast, release the queue, mark for page reset.
     if (!bestText && Date.now() - lastProgressAt >= stallWindowMs && Date.now() - start >= stallWindowMs) {
-      markSessionDegraded(`text turn stalled: no page progress for ${Math.round((Date.now() - lastProgressAt) / 1000)}s`);
+      markSessionDegraded(`text turn stalled: no page progress for ${Math.round((Date.now() - lastProgressAt) / 1000)}s`, slotOf(p));
       await saveDebugSnapshot(p, 'text_stalled').catch(() => {});
       const err = new Error(`ChatGPT page showed no progress for ${Math.round(stallWindowMs / 1000)}s after submit`);
       err.code = 'timeout';
@@ -2028,7 +2110,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
           throw buildError('timeout', `ChatGPT did not return an image within ${maxSec}s (adaptive max reached, still generating)`, await readUiErrorBanner(p));
         }
         const chunk = Math.min(GENERATION_RETRY_TIMEOUT_MS, remaining);
-        liveness.touch(); // chunk boundary — active long generation is not a wedged process
+        liveness.touch(slotOf(p).jobId); // chunk boundary — active long generation is not a wedged process
         const elapsedSec = Math.round((Date.now() - waitStart) / 1000);
         console.log(`[adaptive-timeout] generation still active (stopBtn=${progress.stopBtn} text=${progress.activeText}) — extending +${Math.round(chunk / 1000)}s (elapsed ${elapsedSec}s / max ${maxSec}s)`);
         try {
@@ -2103,7 +2185,7 @@ async function waitAndExtractImage(p, beforeState = { imageIds: [], largeImages:
       const tierLimit = detectTierLimit(limitText || '', context.thinkingMode);
       if (tierLimit) {
         limitKind = 'tier_limit';
-        tierAvailability.noteUnavailable(tierLimit.tier, 'quota-banner', { stickyAfter: 1 });
+        tierAvailability.noteUnavailable(tierLimit.tier, 'quota-banner', { stickyAfter: 1, slotId: slotOf(p).id });
         console.log(`[tiers] image turn hit the ${tierLimit.tier} tier limit — memoized, NOT a global rate limit`);
       }
     }
@@ -2468,7 +2550,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
         && !allLinesLanded(await readComposerText(textareaLocator.first()).catch(() => ''))) {
       // Retyping would append a second copy after the part that did land; sending would
       // deliver a truncated prompt. Neither is right — fail this turn as retryable.
-      markSessionDegraded('prompt landed only partially in the composer');
+      markSessionDegraded('prompt landed only partially in the composer', slotOf(p));
       const err = new Error('Prompt landed only partially in the composer (a line is missing)');
       err.code = 'page_load_failed';
       throw err;
@@ -2506,7 +2588,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     await textareaLocator.first().click().catch(() => {});
     const stillThere = await readComposerText(textareaLocator.first()).catch(() => '');
     if (probe && !normText(stillThere).includes(probe)) {
-      markSessionDegraded('composer lost the prompt before Enter fallback');
+      markSessionDegraded('composer lost the prompt before Enter fallback', slotOf(p));
       const err = new Error('Prompt vanished from composer before submit');
       err.code = 'page_load_failed';
       throw err;
@@ -2532,7 +2614,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     await p.waitForTimeout(500).catch(() => {});
   }
   if (!submitted) {
-    markSessionDegraded('prompt submit not confirmed in 12s');
+    markSessionDegraded('prompt submit not confirmed in 12s', slotOf(p));
     await saveDebugSnapshot(p, 'submit_unconfirmed').catch(() => {});
     // Broken composer often shows an error toast/banner — pass its text to the client.
     const uiError = await readUiErrorBanner(p);
@@ -3194,7 +3276,8 @@ async function setThinkingMode(p, modeOrEnabled, deps = {}) {
   const readPill = deps.readPill || readPillLevel;
   const tryLevel = deps.applyLevel || applyLevel;
   const settle = deps.settle || (async (ms) => { await p.waitForTimeout(ms).catch(() => {}); });
-  const degrade = deps.markDegraded || markSessionDegraded;
+  const menuSlot = slotOf(p);
+  const degrade = deps.markDegraded || ((reason) => markSessionDegraded(reason, menuSlot));
   const env = deps.env || process.env;
   const requestedMode = normalizeThinkingMode(modeOrEnabled);
   // Tiers to try, best first: [pro, extra_high] for a Pro request, [x] for everything else.
@@ -3294,7 +3377,7 @@ async function setThinkingMode(p, modeOrEnabled, deps = {}) {
     //                     so require two consecutive agreeing observations;
     //   click-not-applied — a routine Playwright/UI transient: never memoize.
     const strikesNeeded = STICKY_AFTER[reason] ?? Infinity;
-    tierAvailability.noteUnavailable(mode, reason, { stickyAfter: strikesNeeded, env });
+    tierAvailability.noteUnavailable(mode, reason, { stickyAfter: strikesNeeded, env, slotId: menuSlot.id });
     if (isLast) break;
     fallbackReason = reason;
     before = after;               // next hop compares against what the pill shows now
@@ -3302,21 +3385,21 @@ async function setThinkingMode(p, modeOrEnabled, deps = {}) {
 
   const fellBack = effectiveMode !== requestedMode;
   if (verified) {
-    consecutiveMenuFailures = 0;
+    menuSlot.menuFailures = 0;
   } else if (unsupportedTier && !fellBack) {
     // A tier this account cannot select is a caller problem, not a broken adapter. Reset the
     // streak so a run of such requests can never tear the session down.
-    consecutiveMenuFailures = 0;
+    menuSlot.menuFailures = 0;
     console.log(`[ui-adapter] "${targetLevel}" is not selectable on this account — not counting as degradation`);
   } else if (startedAt.level !== targetLevel) {
     // A real switch attempt that did NOT verify (menu didn't open / item click missed /
     // pill unchanged) counts toward degradation regardless of which step failed. Counted
     // ONCE per call, not once per tier in the chain — a downgrade must not double-charge
     // the streak that triggers a session reset.
-    consecutiveMenuFailures++;
-    if (consecutiveMenuFailures >= 2) {
-      degrade(`intelligence switch unverified ${consecutiveMenuFailures}x in a row`);
-      consecutiveMenuFailures = 0;
+    menuSlot.menuFailures++;
+    if (menuSlot.menuFailures >= 2) {
+      degrade(`intelligence switch unverified ${menuSlot.menuFailures}x in a row`);
+      menuSlot.menuFailures = 0;
     }
   }
   if (adapterFailure) {
@@ -3420,10 +3503,11 @@ function appendAspectRatioHint(prompt, aspectRatio) {
 
 // Capability probe: check which Image 2.0 toggles are visible in current UI.
 // Used by /v1/images/capabilities — does NOT click anything.
-async function probeCapabilities() {
+async function probeCapabilities(options = {}) {
+  const slot = adoptJob(options);
   let p;
   try {
-    p = await getPage();
+    p = await getPage(slot);
   } catch {
     return { thinking: false, web_search: false, reference_images: false, error: 'no-session' };
   }
@@ -3455,25 +3539,48 @@ async function probeCapabilities() {
 
 // ==== Core generate / edit ====
 
-// Single-flight guard over the ENTIRE ensureLoggedIn: the startup warm-up and the first
-// request can otherwise interleave — one caller's resetPage()/autoLogin() closing the page
-// out from under another caller mid-isLoggedIn, or two concurrent clearSession()+login runs
-// corrupting one context. Real API requests are already serialized by the routes queue, so
-// the only concurrency here is startup-vs-first-request; sharing one promise makes them wait
-// for a single login instead of racing (Codex review). Cleared in `finally` so a later
-// session expiry re-runs the flow.
-let ensureLoggedInPromise = null;
+// Destructive work (context rebuild, auto-login, hard reset) runs only when the pool
+// has no job in a slot. Routes install the hooks after the pool exists. A caller that
+// already holds the pool exclusive (warm-up, the maintenance functions themselves)
+// passes { exclusive: true } and the work runs inline — requesting maintenance from
+// inside an exclusive would deadlock.
+let poolHooks = null;
 
-function ensureLoggedIn() {
-  if (ensureLoggedInPromise) return ensureLoggedInPromise;
-  const promise = _ensureLoggedIn();
-  ensureLoggedInPromise = promise;
-  // Clear the guard once settled. Use then(clear, clear) rather than .finally() on an
-  // otherwise-unhandled derived promise — the caller handles `promise`'s rejection; a bare
-  // .finally() would leave the derived promise's rejection unhandled on login failure.
-  const clear = () => { if (ensureLoggedInPromise === promise) ensureLoggedInPromise = null; };
-  promise.then(clear, clear);
-  return promise;
+function setPoolHooks(hooks) {
+  poolHooks = hooks || null;
+}
+
+function getPoolHooks() {
+  return poolHooks;
+}
+
+function requestMaintenanceNoAwait(name, fn, sinceEpoch) {
+  if (!poolHooks || typeof poolHooks.requestMaintenance !== 'function') {
+    const err = new Error('pool hooks not set');
+    err.code = 'server_error';
+    throw err;
+  }
+  const pending = poolHooks.requestMaintenance(name, fn, { sinceEpoch });
+  Promise.resolve(pending).catch((err) => {
+    console.log(`[chatgpt] maintenance ${name} failed: ${err && err.message ? err.message : err}`);
+  });
+}
+
+// `if (!opts.exclusive)` is the seam the milestone mutation flips. The inline arm
+// is only for a caller that already holds the pool.
+function runOrDefer(name, fn, slot, opts) {
+  if (!opts.exclusive) {
+    requestMaintenanceNoAwait(name, fn, slot.epoch);
+    const err = new Error(opts.message);
+    err.code = opts.code;
+    err.retryAfterMaintenance = true;
+    throw err;
+  }
+  return fn();
+}
+
+function ensureLoggedIn(slot = getSlot(0), opts = {}) {
+  return _ensureLoggedIn(slot, opts);
 }
 
 // Consecutive inconclusive session checks on the REQUEST path. An unreachable
@@ -3488,7 +3595,7 @@ const CONTEXT_RESET_COOLDOWN_MS = safePositiveInt(process.env.CONTEXT_RESET_COOL
 const SESSION_SAVE_DEADLINE_MS = safePositiveInt(process.env.SESSION_SAVE_DEADLINE_MS, 5000);
 let lastContextResetAt = 0;
 
-async function _ensureLoggedIn() {
+async function _ensureLoggedIn(slot, opts) {
   // The watchdog and a request must never drive the page at the same time. The watchdog
   // skips its tick while work is queued, but that check happens before its own await, so
   // a request arriving right after it would still overlap — wait out an in-flight probe
@@ -3500,24 +3607,25 @@ async function _ensureLoggedIn() {
       // The watchdog is still holding a page that will not answer. Don't start working on
       // it — discard it (which also unblocks the watchdog's own pending call) and rebuild.
       console.log('[chatgpt] watchdog probe did not release the page within the lease budget — discarding it');
-      markSessionDegraded('session probe lease timeout');
-      closeWedgedPage(page);
+      markSessionDegraded('session probe lease timeout', slot);
+      closeWedgedPage(slot.page);
       sessionProbeInFlight = null;
     }
   }
 
-  let p = await getPage();
+  let p = await getPage(slot);
   await dismissModals(p);
   const probed = await probeSessionWithRecovery(p, { consecutiveUnknown: consecutiveUnknownChecks });
   const state = probed.state;
   p = probed.page;
+  if (p) bindPage(slot, p);
   if (state === 'in') {
     if (probed.renavigated) {
       // The rebuild we just did IS the recovery any pending reset was asking for, and the
       // page it would destroy is the freshly verified one. Leaving the flag set makes the
       // next operation throw away a known-good page for nothing (Codex review) — and a
       // probe deadline sets it on exactly the path that lands us here.
-      consumePendingReset('session recovered by re-navigation');
+      consumePendingReset(slot, 'session recovered by re-navigation');
     }
     consecutiveUnknownChecks = 0;
     // A confirmed live session means whatever the last login attempt did, we are fine now
@@ -3568,20 +3676,66 @@ async function _ensureLoggedIn() {
         'rebuilding the browser context (cookies are NOT cleared)',
     );
     lastContextResetAt = now;
+    if (opts.exclusive) {
+      await rebuildContextMaintenance(slot);
+      return getPage(slot);
+    }
+    return runOrDefer('context-rebuild', () => rebuildContextMaintenance(slot), slot, {
+      exclusive: false,
+      code: 'login_failed',
+      message: 'session unverifiable — rebuilding the browser context',
+    });
+  }
+
+  // Checked HERE and not earlier: without credentials there is no auto-login to fall back
+  // on, but the non-destructive paths above (refuse / context rebuild) are still the right
+  // behaviour for a `/login`-managed session. Throwing before them left the streak frozen
+  // at 0, so every request paid for a fresh re-navigation and the rebuild never ran.
+  // A missing email or a login cooldown throws WITHOUT a retry marker: nothing was requested.
+  if (!process.env.CHATGPT_EMAIL || !process.env.CHATGPT_PASSWORD) {
+    const e = new Error('Not logged in. Set CHATGPT_EMAIL and CHATGPT_PASSWORD for auto-login.');
+    e.code = 'login_failed';
+    throw e;
+  }
+  const blockedFor = loginThrottle.blockedForMs();
+  if (blockedFor > 0) {
+    const prev = loginThrottle.lastError();
+    const reason = prev ? prev.message : 'previous auto-login failed';
+    const e = new Error(
+      `auto-login on cooldown for ${Math.ceil(blockedFor / 1000)}s after a failed attempt — ${reason}`,
+    );
+    e.code = 'login_failed';
+    if (prev && prev.loginBlocker) e.loginBlocker = prev.loginBlocker;
+    if (prev && prev.loginStep) e.loginStep = prev.loginStep;
+    if (prev && prev.modelMessage) e.modelMessage = prev.modelMessage;
+    throw e;
+  }
+  consecutiveUnknownChecks = 0;
+  if (opts.exclusive) {
+    await autoLoginMaintenance(slot, state);
+    return getPage(slot);
+  }
+  return runOrDefer('auto-login', () => autoLoginMaintenance(slot, state), slot, {
+    exclusive: false,
+    code: 'login_failed',
+    message: `session check returned "${state}" — auto-login requested`,
+  });
+}
+
+async function rebuildContextMaintenance(slot) {
+  try {
     // Persist whatever the live context has before tearing it down: hardResetBrowser()
     // reloads the last session.json snapshot, so cookies refreshed since the previous save
     // would otherwise be silently rolled back (Codex review). Best-effort and bounded — a
     // failed save must not block the recovery it is protecting.
     await raceDeadline(saveSession().catch(() => {}), SESSION_SAVE_DEADLINE_MS);
     await hardResetBrowser().catch((e) => console.log('[chatgpt] context rebuild failed:', e.message));
-    const rebuilt = await getPage();
+    const rebuilt = await getPage(slot);
     await dismissModals(rebuilt);
     const after = await probeSessionState(rebuilt);
     sessionHealth.recordProbe(after, 'context_reset');
     if (after === 'in') {
-      // A full context rebuild satisfies ANY reset that was pending, and the page it would
-      // otherwise discard is the one we just confirmed live (Codex review).
-      consumePendingReset('browser context rebuilt and session confirmed');
+      consumePendingReset(slot, 'browser context rebuilt and session confirmed');
       consecutiveUnknownChecks = 0;
       loginThrottle.recordSuccess();
       await maybeDisableMemory(rebuilt);
@@ -3599,23 +3753,19 @@ async function _ensureLoggedIn() {
       e.code = 'login_failed';
       throw e;
     }
-    // 'out' — now CONFIRMED logged out, so the destructive path below is justified.
+    // 'out' — confirmed logged out. The destructive login stays inside this maintenance.
+    return await autoLoginMaintenance(slot, 'out');
+  } finally {
+    resetAllSlotPages();
   }
-  consecutiveUnknownChecks = 0;
+}
 
-  // Checked HERE and not earlier: without credentials there is no auto-login to fall back
-  // on, but the non-destructive paths above (refuse / context rebuild) are still the right
-  // behaviour for a `/login`-managed session. Throwing before them left the streak frozen
-  // at 0, so every request paid for a fresh re-navigation and the rebuild never ran.
+async function autoLoginMaintenance(slot, state) {
   if (!process.env.CHATGPT_EMAIL || !process.env.CHATGPT_PASSWORD) {
     const e = new Error('Not logged in. Set CHATGPT_EMAIL and CHATGPT_PASSWORD for auto-login.');
     e.code = 'login_failed';
     throw e;
   }
-
-  // A login that just failed on a blocking screen will fail the same way one second later;
-  // retrying per request only burns attempts (and "too many attempts" is itself one of the
-  // screens we get blocked by). Re-surface the previous, already-diagnosed reason instead.
   const blockedFor = loginThrottle.blockedForMs();
   if (blockedFor > 0) {
     const prev = loginThrottle.lastError();
@@ -3624,32 +3774,38 @@ async function _ensureLoggedIn() {
       `auto-login on cooldown for ${Math.ceil(blockedFor / 1000)}s after a failed attempt — ${reason}`,
     );
     e.code = 'login_failed';
-    if (prev && prev.loginBlocker) e.loginBlocker = prev.loginBlocker;
-    if (prev && prev.loginStep) e.loginStep = prev.loginStep;
-    if (prev && prev.modelMessage) e.modelMessage = prev.modelMessage;
     throw e;
   }
-
   console.log(`[chatgpt] Session check returned "${state}" — triggering auto-login...`);
   // From here on the old session is being destroyed (autoLogin → clearSession), so the
-  // gauge must drop immediately and without hysteresis: if the login then fails there is
-  // no page left to probe, and every later watchdog tick would be an inconclusive
-  // 'unknown' that deliberately never lowers the gauge (Codex review).
+  // gauge must drop immediately and without hysteresis.
   sessionHealth.invalidate(`relogin:${state}`);
   try {
-    resetPage();
+    resetPage(slot);
     const ctx = await getContext();
     await autoLogin(ctx);
+    const fresh = await getPage(slot);
+    // Authoritative post-login check: autoLogin() declares success on a visible textarea,
+    // which is the same false-positive class we fixed in isLoggedIn.
+    const after = await probeSessionState(fresh);
+    if (after !== 'in') {
+      const e = new Error(`auto-login completed but session is still not authenticated (check="${after}")`);
+      e.code = 'login_failed';
+      e.loginBlocker = 'unknown';
+      recordLoginFailure('unknown');
+      loginThrottle.recordFailure(e);
+      sessionHealth.invalidate(`post_login:${after}`);
+      throw e;
+    }
+    sessionHealth.recordProbe(after, 'post_login');
+    loginThrottle.recordSuccess();
+    await maybeDisableMemory(fresh);
+    return fresh;
   } catch (e) {
-    // Any failure of the login flow (blocked screen, bad creds, TOTP, Cloudflare, timeout,
-    // or a Node system error like EACCES/ENOSPC/network) is a login failure — classify it as
-    // such for metrics/alerting. System errors carry their OWN `.code` (EACCES…), so a
-    // conditional `if (!e.code)` would misclassify them as server_error; wrap unconditionally,
-    // keeping the original as `cause` for the logs.
+    if (e && e.code === 'login_failed' && e.loginBlocker) throw e;
+    if (e && e.code === 'login_failed' && /not authenticated|cooldown|CHATGPT_EMAIL/.test(e.message || '')) throw e;
     const err = new Error(`auto-login failed: ${e.message}`);
     err.code = 'login_failed';
-    // Carry the diagnosed blocker outward: it lands in the API error body, the log line and
-    // the gpt_web_gateway_login_failures_total{blocker=…} counter.
     err.loginBlocker = e.loginBlocker || 'unknown';
     err.loginStep = e.loginStep;
     if (e.modelMessage) err.modelMessage = e.modelMessage;
@@ -3658,28 +3814,9 @@ async function _ensureLoggedIn() {
     loginThrottle.recordFailure(err);
     sessionHealth.invalidate(`login_failed:${err.loginBlocker}`);
     throw err;
+  } finally {
+    resetAllSlotPages();
   }
-  const fresh = await getPage();
-  // Authoritative post-login check: autoLogin() declares success on a visible textarea, which
-  // is the same false-positive class we fixed in isLoggedIn — so verify via the session
-  // endpoint before handing the page to a request. If it's still not logged in, surface a
-  // typed login_failed instead of proceeding into an operation that will fail confusingly.
-  const after = await probeSessionState(fresh);
-  if (after !== 'in') {
-    const e = new Error(`auto-login completed but session is still not authenticated (check="${after}")`);
-    e.code = 'login_failed';
-    e.loginBlocker = 'unknown';
-    recordLoginFailure('unknown');
-    loginThrottle.recordFailure(e);
-    // The cookies were just cleared and the login did not take — this is a hard "no
-    // session", regardless of whether the post-check was 'out' or merely 'unknown'.
-    sessionHealth.invalidate(`post_login:${after}`);
-    throw e;
-  }
-  sessionHealth.recordProbe(after, 'post_login');
-  loginThrottle.recordSuccess();
-  await maybeDisableMemory(fresh);
-  return fresh;
 }
 
 // ==== Traffic-independent session watchdog ====
@@ -3707,15 +3844,11 @@ async function checkSessionOnce({ force = false } = {}) {
     sessionHealth.recordSkip('probe_in_flight');
     return 'skipped';
   }
-  if (!force && liveness.snapshot().queue_size > 0) {
+  if (!force && !poolIsIdle()) {
     sessionHealth.recordSkip('queue_busy');
     return 'skipped';
   }
-  if (ensureLoggedInPromise) {
-    sessionHealth.recordSkip('login_in_flight');
-    return 'skipped';
-  }
-  if (pendingReset) {
+  if (getSlot(0).pendingReset) {
     // The page is already known-suspect and is about to be rebuilt by the next operation;
     // probing it would only risk another hung call (Codex review).
     sessionHealth.recordSkip('reset_pending');
@@ -3725,8 +3858,8 @@ async function checkSessionOnce({ force = false } = {}) {
     sessionHealth.recordSkip('recent_traffic');
     return 'skipped';
   }
-  const p = page;
-  if (!p || p.isClosed()) {
+  const p = getSlot(0).page;
+  if (!p || (p.isClosed && p.isClosed())) {
     // No page = nothing to ask. Deliberately does NOT open one: booting a browser from a
     // timer could race the request path. Stays 'unknown', which keeps the gauge at its
     // last value and ages session_check_age_seconds.
@@ -3774,13 +3907,31 @@ function stopSessionWatchdog() {
 // fresh pod (or one whose session.json expired while it was down) re-logs-in immediately
 // rather than failing the first caller. Best-effort: any failure is logged and swallowed;
 // the normal per-request ensureLoggedIn still runs as the safety net.
+function poolIsIdle() {
+  if (!poolHooks || typeof poolHooks.status !== 'function') {
+    return liveness.snapshot().queue_size === 0;
+  }
+  const status = poolHooks.status();
+  const maintenance = status.maintenance || {};
+  const pending = maintenance.pending || [];
+  return status.running === 0 && status.waiting === 0 && !maintenance.active && pending.length === 0;
+}
+
 async function ensureSessionReady() {
-  try {
-    const p = await ensureLoggedIn();
+  const run = async () => {
+    const slot = getSlot(0);
+    const p = await ensureLoggedIn(slot, { exclusive: true });
     const state = await probeSessionState(p);
     sessionHealth.recordProbe(state, 'startup');
     console.log(`[startup] session ready — state=${state}`);
     return state === 'in';
+  };
+  let release = null;
+  try {
+    if (poolHooks && typeof poolHooks.acquireExclusive === 'function') {
+      release = await poolHooks.acquireExclusive('startup');
+    }
+    return await run();
   } catch (e) {
     // A failed warm-up used to leave zero externally visible trace — the gauge now shows it.
     sessionHealth.recordProbe('out', 'startup_failed');
@@ -3789,6 +3940,8 @@ async function ensureSessionReady() {
       console.log(`[startup] login blocker = ${e.loginBlocker} — manual /login may be required`);
     }
     return false;
+  } finally {
+    if (typeof release === 'function') release();
   }
 }
 
@@ -3833,8 +3986,9 @@ async function maybeDisableMemory(p) {
 // options: { thinking/thinkingMode, aspectRatio, quality, references: [{buffer,mimeType,filename}], reuseChat }
 // Returns { url, b64_json, contentType, applied: { thinking, references_attached } }
 async function generateImage(prompt, options = {}) {
-  await maybeRecoverSession();
-  let p = await ensureLoggedIn();
+  const slot = adoptJob(options);
+  await maybeRecoverSession(slot);
+  let p = await ensureLoggedIn(slot);
 
   if (!options.reuseChat) await ensureNewChat(p);
   else await composerPreflight(p); // reuseChat skips ensureNewChat — overlays still must die
@@ -3858,13 +4012,14 @@ async function generateImage(prompt, options = {}) {
   const finalPrompt = appendAspectRatioHint(`Generate an image: ${prompt}${qualityHint}`, options.aspectRatio);
   const beforeState = await captureConversationState(p);
   const preserveAttachments = isFirstTurn && referencesAttached > 0;
+  if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();
   await typeAndSubmit(p, finalPrompt, preserveAttachments);
   const result = await waitAndExtractImage(p, beforeState, {
     prompt,
     thinkingMode: thinkingState.mode || thinkingMode,
     refs: referencesAttached,
   });
-  if (thinkingState.verified) markHealthyCompletion();
+  if (thinkingState.verified) markHealthyCompletion(slot);
   return {
     ...result,
     applied: {
@@ -3881,8 +4036,9 @@ async function generateImage(prompt, options = {}) {
 }
 
 async function editImage(prompt, imageInput, options = {}) {
-  await maybeRecoverSession();
-  let p = await ensureLoggedIn();
+  const slot = adoptJob(options);
+  await maybeRecoverSession(slot);
+  let p = await ensureLoggedIn(slot);
 
   if (!options.reuseChat) await ensureNewChat(p);
   else await composerPreflight(p);
@@ -3915,13 +4071,14 @@ async function editImage(prompt, imageInput, options = {}) {
   const qualityHint = options.quality ? `\n\nQuality: ${options.quality}.` : '';
   const finalPrompt = appendAspectRatioHint(`Edit this image: ${prompt}${qualityHint}`, options.aspectRatio);
   const beforeState = await captureConversationState(p);
+  if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();
   await typeAndSubmit(p, finalPrompt, true);
   const result = await waitAndExtractImage(p, beforeState, {
     prompt,
     thinkingMode: thinkingState.mode || thinkingMode,
     refs: referencesConfirmed,
   });
-  if (thinkingState.verified) markHealthyCompletion();
+  if (thinkingState.verified) markHealthyCompletion(slot);
   return {
     ...result,
     applied: {
@@ -3938,6 +4095,7 @@ async function editImage(prompt, imageInput, options = {}) {
 }
 
 async function completeText(prompt, options = {}) {
+  const slot = adoptJob(options);
   // Page-load failures on chatgpt.com tend to come in bursts (CF challenge,
   // empty SPA boot, transient 5xx from OpenAI). One in-process retry leaves a
   // visible failure rate on the caller; multiple attempts with a fresh page each
@@ -3963,8 +4121,8 @@ async function completeText(prompt, options = {}) {
     try {
       // Prep is INSIDE the try — ensureNewChat/setThinkingMode can also die on a broken
       // page, and those failures must ride the same retry/hard-reset machinery.
-      await maybeRecoverSession();
-      const p = await ensureLoggedIn();
+      await maybeRecoverSession(slot);
+      const p = await ensureLoggedIn(slot);
 
       if (options.conversationId) await openConversation(p, options.conversationId);
       else if (!options.reuseChat || attempt > 0) await ensureNewChat(p);
@@ -3986,11 +4144,12 @@ async function completeText(prompt, options = {}) {
       //     them land while `currentCapture` is still null, which is exactly what marks them
       //     stale.
       await primeMainWorld(p);
-      const capture = beginBackendCapture(); // null unless READ_VIA_BACKEND_API=1
+      const capture = beginBackendCapture(slot); // null unless READ_VIA_BACKEND_API=1
       // Mark submitted at the confirmed-send instant (inside typeAndSubmit), not just on
       // return — a failure in its trailing settle wait must still count as submitted so we
       // never retry into a duplicate send. The post-call assignment is a backstop.
       const timing = {};
+      if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();
       try {
         await typeAndSubmit(p, prompt, false, () => { submitted = true; }, timing);
       } finally {
@@ -4007,7 +4166,7 @@ async function completeText(prompt, options = {}) {
         inputMs: inputSpentMs, // every attempt's input, not just this one's
       });
 
-      if (thinkingState.verified) markHealthyCompletion();
+      if (thinkingState.verified) markHealthyCompletion(slot);
       // conversation_id sources, best first: backend-api capture → chat URL after the
       // answer → the id the caller asked to continue. May stay null (e.g. the answer
       // finished before the SPA navigated to /c/<id>).
@@ -4026,6 +4185,7 @@ async function completeText(prompt, options = {}) {
         },
       };
     } catch (err) {
+      if (err && err.retryAfterMaintenance) throw err;
       lastError = err;
       const isPageLoad =
         err.code === 'page_load_failed' || /content failed to load/i.test(err.message || '');
@@ -4055,39 +4215,70 @@ async function completeText(prompt, options = {}) {
         if (anyDeltaEmitted && transient && !lastAttempt) {
           console.log('[chatgpt] transient failure AFTER streaming started — not retrying (streamed prefix cannot be reconciled)');
         }
-        // Giving up — but still clear a poisoned context so the NEXT request starts clean.
-        if (needsHardReset) await hardResetBrowser();
+        // Giving up — request a hard reset without holding the slot, and rethrow
+        // the original error. The prompt was already submitted, or this was the
+        // last attempt, so the pool must not retry it as a fresh send.
+        if (needsHardReset) {
+          requestMaintenanceNoAwait('hard-reset', () => hardResetBrowser(), slot.epoch);
+        }
         throw err;
       }
 
       console.log(`[chatgpt] Text turn failed (${err.code || 'page_load'}) — ${needsHardReset ? 'hard browser reset' : 'fresh page'}, retry ${attempt + 2}/${maxAttempts}...`);
       if (needsHardReset) {
-        await hardResetBrowser();
+        // Pre-submit: hand the slot back and let the pool run the reset between jobs.
+        requestMaintenanceNoAwait('hard-reset', () => hardResetBrowser(), slot.epoch);
+        const again = new Error(err.message);
+        again.code = err.code || 'page_load_failed';
+        again.retryAfterMaintenance = true;
+        throw again;
       } else {
-        resetPage();
+        resetPage(slot);
       }
       // Light backoff so we don't slam ChatGPT during a wider outage.
       await new Promise(r => setTimeout(r, 1500 + 1000 * attempt));
     } finally {
       // Stop feeding this turn's accumulator — a late/leaked SSE body from an aborted
       // attempt must never bleed into the next turn's capture.
-      endBackendCapture();
+      endBackendCapture(slot);
     }
   }
   throw lastError;
 }
 
-function resetPage() {
-  if (page && !page.isClosed()) page.close().catch(() => {});
-  page = null;
+function discardSlotPage(slot) {
+  const victim = slot;
+  const p = victim.page;
+  try {
+    if (p && (!p.isClosed || !p.isClosed())) {
+      const closed = p.close();
+      if (closed && typeof closed.catch === 'function') closed.catch(() => {});
+    }
+  } catch {}
+  if (p) pageToSlot.delete(p);
+  victim.page = null;
+  victim.pagePromise = null;
+  victim.capture = null;
+  victim.lastConversationFetch = null;
 }
 
-// Full browser-context rebuild: closes the browser so the next getContext() relaunches a
-// clean context (new service-worker scope, fresh storageState from session.json). Recovers
-// from a poisoned app-shell cache that survives plain page resets. Login is preserved —
-// getContext reloads session.json and ensureLoggedIn re-triggers auto-login if expired.
+function resetPage(slot = getSlot(0)) {
+  discardSlotPage(slot);
+}
+
+function resetAllSlotPages() {
+  for (const slot of slotsById.values()) {
+    discardSlotPage(slot);
+    slot.pendingReset = null;
+    slot.staleStreams = new Set();
+  }
+}
+
+// Full browser-context rebuild: closes every slot's page, then the browser, so the
+// next getContext() relaunches a clean context. Login is preserved — getContext
+// reloads session.json and ensureLoggedIn re-triggers auto-login if expired.
 async function hardResetBrowser() {
-  resetPage();
+  resetAllSlotPages();
   await closeBrowser().catch(() => {});
 }
 
@@ -4104,6 +4295,12 @@ module.exports = {
   stopSessionWatchdog,
   checkSessionOnce,
   resetPage,
+  resetAllSlotPages,
+  hardResetBrowser,
+  ensureLoggedIn,
+  setPoolHooks,
+  getPoolHooks,
+  getSlot,
   probeCapabilities,
   normalizeThinkingMode,
   READ_VIA_BACKEND_API,
@@ -4128,7 +4325,11 @@ module.exports = {
     setThinkingMode,
     waitAndExtractImage,
     canvasExtractInPage,
-    menuFailures: () => consecutiveMenuFailures,
-    resetMenuFailures: () => { consecutiveMenuFailures = 0; },
+    menuFailures: () => getSlot(0).menuFailures,
+    resetMenuFailures: () => { getSlot(0).menuFailures = 0; },
+    acceptSseChunk,
+    noteConversation: rememberConversation,
+    bindPage,
+    markHealthyCompletion,
   },
 };

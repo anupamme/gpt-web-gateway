@@ -166,8 +166,8 @@ function createTurnGate({
   if (!Number.isInteger(slots) || slots < 1) {
     throw new TypeError('slots must be an integer >= 1');
   }
-  const pacers = Array.from({ length: slots }, () => (
-    createPacer({ now, sleep, gap, heartbeat, heartbeatMs })
+  const pacers = Array.from({ length: slots }, (_, slotId) => (
+    createPacer({ now, sleep, gap, heartbeat: () => heartbeat(slotId), heartbeatMs })
   ));
   // Null until the first reservation. The first turn of an idle gate must not
   // pay the stagger: there is no peer it could land on top of.
@@ -195,7 +195,7 @@ function createTurnGate({
   // already past that start, only this caller leaves: everyone else waits a
   // fresh stagger from the actual release. A clock that never moves still
   // returns after the slices we asked to sleep, or the wait would spin.
-  async function awaitStagger() {
+  async function awaitStagger(slotId) {
     let waited = 0;
     const beat = heartbeatMs > 0 ? heartbeatMs : 1;
     let start = reserve(now());
@@ -210,14 +210,31 @@ function createTurnGate({
       }
       let guard = due - now();
       const planned = due;
+      // A timer that wakes before the slice is up must not release the gate.
+      // Shrink by the time that actually passed. A clock that never moves
+      // still has to end: shrink by the slice we asked for, then stamp the
+      // planned release so the next gate keeps the stagger.
+      let moved = false;
       while (guard > 0 && now() < planned) {
         const slice = Math.min(guard, beat);
+        const before = now();
         await sleep(slice);
-        heartbeat();
+        heartbeat(slotId);
         waited += slice;
-        guard = Math.min(Math.max(0, planned - now()), guard - slice);
+        const elapsed = now() - before;
+        if (elapsed > 0) {
+          moved = true;
+          guard = Math.min(Math.max(0, planned - now()), guard - elapsed);
+        } else {
+          guard -= slice;
+        }
       }
-      if (now() < planned) return waited;
+      if (now() < planned) {
+        if (moved) continue;
+        lastReleasedAt = planned;
+        if (lastReservedStart < planned) lastReservedStart = planned;
+        return waited;
+      }
     }
   }
 
@@ -225,7 +242,7 @@ function createTurnGate({
     async gate(slotId) {
       checkSlot(slotId);
       const gapWaited = await pacers[slotId].gate();
-      const staggerWaited = await awaitStagger();
+      const staggerWaited = await awaitStagger(slotId);
       throttledMs += gapWaited + staggerWaited;
       return gapWaited + staggerWaited;
     },

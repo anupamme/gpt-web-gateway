@@ -7,12 +7,14 @@ const multer = require('multer');
 // disagree with the actual interception layer about the flag's default.
 const {
   generateImage, editImage, completeText, probeCapabilities, READ_VIA_BACKEND_API,
+  setPoolHooks,
 } = require('../chatgpt');
 const { parseBool, normalizeThinkingMode, parseThinkingMode, parseWebSearchRequested } = require('../params');
 const { isValidConversationId } = require('../lib/conversation-read');
 const { createStreamEmitter } = require('../lib/sse-transform');
 const { progress } = require('../progress');
-const { createPacer } = require('../pacer');
+const { createTurnGate, heartbeatMsFor } = require('../pacer');
+const { createJobPool, parseConcurrency } = require('../job-pool');
 const {
   incRequests, incGenerations, incEdits, incError, classifyError, incQueueFull,
   observeDuration, shouldRetryKind,
@@ -121,30 +123,84 @@ function bumpBatchMetric(n) {
 }
 
 // --- Concurrency & rate-limit settings ---
-// Image 2.0: ~10-25s/image (vs 60-120s for 1.5) → can hold larger queue without timeouts
+// Image 2.0: ~10-25s/image (vs 60-120s for 1.5) → can hold larger queue without timeouts.
+// MAX_QUEUE_SIZE is the limit on jobs WAITING for a slot, not running+waiting.
 const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE, 10) || 5;
 const RATE_LIMIT_COOLDOWN_MS = (parseInt(process.env.RATE_LIMIT_COOLDOWN_MINUTES, 10) || 30) * 60 * 1000;
 const QUEUE_FULL_RETRY_AFTER = parseInt(process.env.QUEUE_FULL_RETRY_AFTER_SEC, 10) || 60;
+// A maintenance pass that is still heartbeating past this is hung. The cap is
+// per pass, so a reset that never returns becomes visible to /health/live.
+const MAINTENANCE_HEARTBEAT_MAX_MS = 900000;
 
-// Queue for sequential processing (one browser = one request at a time)
-let queue = Promise.resolve();
-let queueSize = 0;
+const concurrency = parseConcurrency();
+const pool = createJobPool({ concurrency, maxWaiting: MAX_QUEUE_SIZE });
 let rateLimitedUntil = 0; // timestamp when cooldown expires
 
-// Proactive gap between upstream turns. RATE_LIMIT_COOLDOWN_MS above is the
-// reactive half — it arms after ChatGPT refuses; this one keeps us from getting
-// there. Details and the reasoning live in src/pacer.js.
-//
-// The heartbeat is what makes a deliberate pause legible to the liveness
-// detector: a waiting job holds a queue slot, and without a touch the detector
-// would read "queued work, no progress" and restart the container.
-const pacer = createPacer({ heartbeat: () => progress.touch() });
+// slotId → jobId of the job holding that slot, so a pause heartbeat refreshes
+// THAT job and not only the shared stamp.
+const jobIdBySlot = new Map();
+
+// Per-slot finish gap plus a cross-slot stagger. The heartbeat receives the
+// slot that is waiting, which is what lets a long gap stay alive per job.
+const turnGate = createTurnGate({
+  slots: concurrency,
+  heartbeat: (slotId) => progress.touch(jobIdBySlot.get(slotId)),
+});
+
+function startMaintenanceHeartbeat() {
+  const started = Date.now();
+  const intervalMs = heartbeatMsFor();
+  let timer = setInterval(() => {
+    if (Date.now() - started >= MAINTENANCE_HEARTBEAT_MAX_MS) {
+      clearInterval(timer);
+      timer = null;
+      return;
+    }
+    progress.touch();
+  }, intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+  return () => {
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+}
+
+// Hooks land here, in the route that owns the pool, so chatgpt.js never requires
+// this module. Heartbeats start only once the work is actually active: a skipped
+// maintenance request resolves without calling fn, and an exclusive starts its
+// timer when the release function is handed back.
+setPoolHooks({
+  requestMaintenance(name, fn, opts) {
+    return pool.requestMaintenance(name, async () => {
+      const stop = startMaintenanceHeartbeat();
+      try {
+        return await fn();
+      } finally {
+        stop();
+      }
+    }, opts);
+  },
+  acquireExclusive(name) {
+    return pool.acquireExclusive(name).then((release) => {
+      const stop = startMaintenanceHeartbeat();
+      let released = false;
+      return () => {
+        if (released) return undefined;
+        released = true;
+        stop();
+        return release();
+      };
+    });
+  },
+  status: () => pool.status(),
+});
 
 // A cooldown armed while this job was already in line must still stop it.
-// checkRateLimit() runs before enqueue() and nothing re-checked afterwards, so
-// after ChatGPT refused, every job already accepted marched on with a 60s gap
-// instead of the 30-minute cooldown — precisely the traffic the cooldown
-// exists to stop. Found by codex.
+// checkRateLimit() runs before the job is accepted and nothing re-checked
+// afterwards, so after ChatGPT refused, every job already accepted marched on
+// with a 60s gap instead of the 30-minute cooldown — precisely the traffic the
+// cooldown exists to stop. Found by codex. The send-time check lives in the
+// beforeSubmit hook, after the gate, and a throw there must not burn the gap.
 function assertNotRateLimited() {
   const remainingMs = rateLimitedUntil - Date.now();
   if (remainingMs <= 0) return;
@@ -157,53 +213,64 @@ function assertNotRateLimited() {
   throw err;
 }
 
-// One upstream turn: refuse outright if a cooldown is already armed, otherwise
-// wait out the gap, re-check (one may have been armed while we waited), then
-// send — and stamp the finish whatever happened. The check runs on both sides
-// of the wait on purpose: sitting out 60s only to refuse afterwards makes the
-// caller pay for a send that was never going to happen. Found by agy.
-async function upstreamTurn(send) {
-  assertNotRateLimited();
-  const waited = await pacer.gate();
-  if (waited > 0) console.log(`[pacer] waited ${Math.round(waited / 1000)}s before an upstream turn`);
-  assertNotRateLimited();
-  try {
-    return await send();
-  } finally {
-    pacer.finished();
-  }
-}
-
-function enqueue(fn) {
-  queueSize++;
-  progress.jobStarted();
-  // Exactly-once liveness accounting per job: success → streak reset; error → classified
-  // kind feeds the consecutive-infra-failure detector (see src/progress.js).
-  //
-  // The pacing gate sits INSIDE the queue slot, after the previous job released
-  // it: the job keeps its place in line while waiting, so callers see ordinary
-  // queue backpressure and never a silent reordering. pacer.finished() runs in
-  // finally, because a refused or timed-out request reached ChatGPT exactly as
-  // a successful one did — pacing is about the account, not our success rate.
-  // fn() paces its own upstream turns through upstreamTurn(), so enqueue does
-  // NOT gate here: a job that sends nothing (or is abandoned before it sends)
-  // should not burn a gap, and a job that sends ten times needs ten gaps, not
-  // one. Everything the queue owes the liveness detector stays here, inside the
-  // try — a gate that rejected outside it would have left the job counted as
-  // started and never finished.
-  const wrapped = async () => {
+// One pool job. jobStarted runs only after submit has accepted the job: submit
+// throws queue_full synchronously, and a rejected admission must not count.
+// The pool schedules fn on a microtask, so jobStarted lands before jobRunning.
+// The first retryAfterMaintenance returns the job to the head and is not a
+// finish; the second (or any other error) settles it exactly once.
+function submitJob(fn, { key } = {}) {
+  let attempts = 0;
+  const promise = pool.submit(async (ctx) => {
+    attempts += 1;
+    jobIdBySlot.set(ctx.slotId, ctx.jobId);
+    progress.jobRunning(ctx.jobId);
     try {
-      const value = await fn();
-      progress.jobFinished(null);
+      const value = await fn(ctx);
+      progress.jobFinished(null, ctx.jobId);
       return value;
     } catch (err) {
-      progress.jobFinished(classifyError(err.message, err.code));
+      if (err && err.retryAfterMaintenance && attempts < 2) {
+        progress.jobRequeued(ctx.jobId);
+        throw err;
+      }
+      progress.jobFinished(classifyError(err && err.message, err && err.code), ctx.jobId);
       throw err;
+    } finally {
+      if (jobIdBySlot.get(ctx.slotId) === ctx.jobId) jobIdBySlot.delete(ctx.slotId);
     }
-  };
-  const p = queue.then(wrapped, wrapped).finally(() => { queueSize--; });
-  queue = p.catch(() => {});
-  return p;
+  }, { key });
+  progress.jobStarted();
+  return promise;
+}
+
+// Text keeps one conversation on one tab. The key is the lowercased id, and
+// this call is the only place a conversation key is handed to the pool.
+function submitTextJob(fn, jobKey) {
+  return submitJob(fn, { key: jobKey });
+}
+
+function conversationKey(id) {
+  if (id == null || id === '') return undefined;
+  return String(id).toLowerCase();
+}
+
+// Pace at send time. finished() runs once per hook that actually returned, so
+// a rate-limit throw inside the hook does not stamp a gap for a send that
+// never happened. A batch calls the same hook once per image.
+async function runTurn(ctx, invoke) {
+  let paced = 0;
+  try {
+    return await invoke({
+      job: { slotId: ctx.slotId, jobId: ctx.jobId, epoch: ctx.epoch },
+      beforeSubmit: async () => {
+        await turnGate.gate(ctx.slotId);
+        assertNotRateLimited();
+        paced += 1;
+      },
+    });
+  } finally {
+    for (let i = 0; i < paced; i += 1) turnGate.finished(ctx.slotId);
+  }
 }
 
 function elapsedSec(startedAt) {
@@ -227,39 +294,45 @@ function checkRateLimit(res, startedAt) {
   return false;
 }
 
-// How long a client turned away for a full queue should wait. The queued jobs
-// themselves PLUS the pacing gap before each of them: quoting the bare
-// QUEUE_FULL_RETRY_AFTER once pacing is on sends the client back too early, it
-// gets 429 again, and every such probe is another request against the account
-// this limit exists to protect. Found by agy.
+// How long a client turned away for a full queue should wait. Waiting jobs
+// share the slots, so the estimate is one gap per ceil(waiting / concurrency)
+// slice, not one gap per waiter. Quoting the bare QUEUE_FULL_RETRY_AFTER once
+// pacing is on sends the client back too early. Found by agy.
 //
-// It is an ESTIMATE and cannot be better than one here: a queued batch owes a
-// gap per image, not per job, and only the running job knows how many turns it
-// has left. It errs low for batches and high for single turns; Math.ceil keeps
-// it a whole number of seconds, which is all Retry-After may carry. Found by codex.
-function queueFullRetryAfterSec(queued) {
-  return Math.ceil(QUEUE_FULL_RETRY_AFTER + queued * pacer.status().min_gap_sec);
+// It is an ESTIMATE: a queued batch owes a gap per image, not per job. Math.ceil
+// keeps it a whole number of seconds, which is all Retry-After may carry.
+function queueFullRetryAfterSec(waiting) {
+  const conc = Math.max(1, pool.status().concurrency);
+  const gaps = Math.ceil(Number(waiting) / conc);
+  return Math.ceil(QUEUE_FULL_RETRY_AFTER + gaps * turnGate.status().min_gap_sec);
+}
+
+function sendQueueFull(res, startedAt, waiting) {
+  const retryAfterSec = queueFullRetryAfterSec(waiting);
+  incQueueFull();
+  observeDuration('queue_full', elapsedSec(startedAt));
+  res.set('Retry-After', String(retryAfterSec));
+  res.status(429).json(buildErrorBody({
+    kind: 'queue_full',
+    message: `Server busy: ${waiting} requests waiting (max ${MAX_QUEUE_SIZE}). Try again in ~${Math.ceil(retryAfterSec / 60)} min.`,
+    retryAfter: retryAfterSec,
+  }));
+  return true;
 }
 
 function checkQueueFull(res, startedAt) {
-  if (queueSize >= MAX_QUEUE_SIZE) {
-    const retryAfterSec = queueFullRetryAfterSec(queueSize);
-    incQueueFull();
-    observeDuration('queue_full', elapsedSec(startedAt));
-    res.set('Retry-After', String(retryAfterSec));
-    res.status(429).json(buildErrorBody({
-      kind: 'queue_full',
-      message: `Server busy: ${queueSize} requests in queue (max ${MAX_QUEUE_SIZE}). Try again in ~${Math.ceil(retryAfterSec / 60)} min.`,
-      retryAfter: retryAfterSec,
-    }));
-    return true;
-  }
-  return false;
+  if (!pool.isFull()) return false;
+  return sendQueueFull(res, startedAt, pool.status().waiting);
 }
 
 // Single source of truth for error responses: classifies err, increments counters,
 // observes duration, and emits the structured error body with the right HTTP code.
+// queue_full is thrown synchronously by submit when the waiting list fills in
+// the gap after checkQueueFull; answering it as 500 would retry into the wall.
 function respondWithError(res, startedAt, err) {
+  if (err && err.code === 'queue_full') {
+    return sendQueueFull(res, startedAt, pool.status().waiting);
+  }
   handleRateLimitError(err);
   const errorType = classifyError(err.message, err.code);
   incError(errorType);
@@ -508,17 +581,19 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
     let maxAbVariants = 0;
     let abSelectedIndex = null;
     const errors = [];
-    const results = await enqueue(async () => {
+    const results = await submitJob((ctx) => runTurn(ctx, async ({ job, beforeSubmit }) => {
       const out = [];
       for (let i = 0; i < n; i++) {
         try {
-          const result = await upstreamTurn(() => generateImage(prompt, {
+          const result = await generateImage(prompt, {
             thinkingMode,
             aspectRatio,
             quality,
             references: i === 0 ? references : [],
             reuseChat: i > 0,
-          }));
+            job,
+            beforeSubmit,
+          });
           progress.touch(); // per-image heartbeat — long legit batches must not look stuck
           if (i === 0 && result.applied) firstApplied = result.applied;
           if (result.applied) turnTiers.push(result.applied);
@@ -538,7 +613,11 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
           }
           out.push(item);
         } catch (turnErr) {
-          // Bug #4 (Opus): partial batch failure used to throw out of enqueue and lose
+          // A maintenance marker has to reach the pool so the job can return to
+          // the head. Swallowing it as a partial batch would finish the job
+          // while the browser reset is still queued.
+          if (turnErr && turnErr.retryAfterMaintenance) throw turnErr;
+          // Bug #4 (Opus): partial batch failure used to throw out of the job and lose
           // every already-saved image (disk leak + lost results). Now we record the
           // error per-turn and continue, returning `partial: true` if some succeeded.
           console.error(`[batch ${i + 1}/${n}] failed:`, turnErr.message);
@@ -554,7 +633,7 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
         }
       }
       return out;
-    });
+    }));
 
     incGenerations();
     bumpBatchMetric(n);
@@ -725,11 +804,13 @@ router.post('/v1/images/edits', maybeMultipart, async (req, res) => {
   const host = `${req.protocol}://${req.get('host')}`;
 
   try {
-    const result = await enqueue(() => upstreamTurn(() => editImage(prompt, imageInput, {
+    const result = await submitJob((ctx) => runTurn(ctx, ({ job, beforeSubmit }) => editImage(prompt, imageInput, {
       thinkingMode,
       aspectRatio,
       quality,
       references,
+      job,
+      beforeSubmit,
     })));
 
     let data;
@@ -877,10 +958,12 @@ async function handleTextCompletion(req, res, prompt) {
   }
 
   try {
-    const result = await enqueue(() => upstreamTurn(() => completeText(prompt, {
+    const result = await submitTextJob((ctx) => runTurn(ctx, ({ job, beforeSubmit }) => completeText(prompt, {
       thinkingMode,
       conversationId,
-    })));
+      job,
+      beforeSubmit,
+    })), conversationKey(conversationId));
 
     const applied = result.applied || { thinking: false, thinking_mode: 'instant' };
     progress.clearPartialInfra(); // any full success proves the session alive
@@ -971,9 +1054,11 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
   };
 
   try {
-    const result = await enqueue(() => upstreamTurn(() => completeText(prompt, {
+    const result = await submitTextJob((ctx) => runTurn(ctx, ({ job, beforeSubmit }) => completeText(prompt, {
       thinkingMode,
       conversationId,
+      job,
+      beforeSubmit,
       // Called with the latest FULL text; the emitter turns it into append-only deltas.
       onDelta: (fullText) => {
         try {
@@ -1065,13 +1150,18 @@ router.post('/v1/responses', async (req, res) => {
 router.get('/v1/images/status', (req, res) => {
   const now = Date.now();
   const rateLimited = rateLimitedUntil > now;
+  const poolStatus = pool.status();
   res.json({
     status: rateLimited ? 'rate_limited' : 'ok',
-    queue_size: queueSize,
+    queue_size: poolStatus.running + poolStatus.waiting,
+    running: poolStatus.running,
+    waiting: poolStatus.waiting,
+    concurrency: poolStatus.concurrency,
+    slots: poolStatus.slots,
     max_queue_size: MAX_QUEUE_SIZE,
     // An invisible limit reads as a broken service: without this the caller
     // only sees response times growing and concludes the gateway is wedged.
-    pacing: pacer.status(),
+    pacing: turnGate.status(),
     max_batch_n: MAX_BATCH_N,
     batch_metric: totalGenerationsByN,
     ...(rateLimited && {
@@ -1082,12 +1172,19 @@ router.get('/v1/images/status', (req, res) => {
 });
 
 // GET /v1/images/capabilities — probe which Image 2.0 toggles are visible right now.
-// Cached 60s + single-flight. probe is a read-only page.evaluate (no clicks),
-// so it does NOT need to share the generation queue — using enqueue() would deadlock
-// /capabilities behind a 3-min batch (Opus review #3).
+// Cached 60s + single-flight. A fresh cache is a normal hit. A stale cache is
+// served when the pool is busy. With no cache the probe is an ordinary pool job
+// (its own slot); a full pool is 429 queue_full, the same as any other request.
 const CAPABILITIES_CACHE_TTL_MS = parseInt(process.env.CAPABILITIES_CACHE_TTL_MS, 10) || 60 * 1000;
 let capsCache = { at: 0, value: null };
 let capsInFlight = null;
+
+function poolBusy() {
+  const poolStatus = pool.status();
+  const maintenance = poolStatus.maintenance || {};
+  const pending = maintenance.pending || [];
+  return poolStatus.running > 0 || poolStatus.waiting > 0 || !!maintenance.active || pending.length > 0;
+}
 
 async function getCapabilitiesSingleflight() {
   const now = Date.now();
@@ -1095,15 +1192,16 @@ async function getCapabilitiesSingleflight() {
   if (capsCache.value && now - capsCache.at < CAPABILITIES_CACHE_TTL_MS) {
     return { value: capsCache.value, cached: true };
   }
-  // If queue is busy, serve stale cache instead of probing the live page
-  // (avoids racing with active generation and avoids long client waits).
-  if (queueSize > 0 && capsCache.value) {
+  // Busy pool: do not queue a probe behind a live job when a previous answer exists.
+  if (poolBusy() && capsCache.value) {
     return { value: capsCache.value, cached: true, stale: true };
   }
   if (capsInFlight) return await capsInFlight;
   capsInFlight = (async () => {
     try {
-      const caps = await probeCapabilities();
+      const caps = await submitJob((ctx) => probeCapabilities({
+        job: { slotId: ctx.slotId, jobId: ctx.jobId, epoch: ctx.epoch },
+      }));
       const payload = {
         model: 'gpt-image-2-via-chatgpt-web',
         supported: {
@@ -1133,10 +1231,12 @@ async function getCapabilitiesSingleflight() {
 }
 
 router.get('/v1/images/capabilities', async (req, res) => {
+  const startedAt = Date.now();
   try {
     const result = await getCapabilitiesSingleflight();
     res.json({ ...result.value, cached: result.cached, stale: result.stale || false });
   } catch (err) {
+    if (err && err.code === 'queue_full') return sendQueueFull(res, startedAt, pool.status().waiting);
     res.status(500).json({ error: { message: err.message, type: 'server_error' } });
   }
 });

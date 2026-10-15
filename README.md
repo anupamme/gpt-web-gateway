@@ -274,12 +274,14 @@ Every endpoint returns a uniform error shape:
 | `CHATGPT_EMAIL` | ChatGPT account email (enables auto-login) | — |
 | `CHATGPT_PASSWORD` | ChatGPT account password (auto-login) | — |
 | `CHATGPT_TOTP_SECRET` | Base32 TOTP secret for 2FA (auto-login) | — |
-| `MAX_QUEUE_SIZE` | Max queued requests; above this the gateway replies 429 `queue_full` | `5` |
+| `MAX_QUEUE_SIZE` | Max jobs **waiting** for a slot; running jobs do not count. Above this the gateway replies 429 `queue_full` | `5` |
+| `MAX_CONCURRENT_JOBS` | How many browser tabs run jobs at once. Integer 1..5. Each job gets its own tab | `3` |
+| `MIN_TURN_STAGGER_SEC` | Minimum gap between the moments two different tabs **start** an upstream turn, so parallel tabs do not hit ChatGPT on the same instant. `0` disables the stagger. Distinct from `MIN_JOB_GAP_SEC`, which is the per-tab pause after a turn finishes | `10` |
 | `MAX_BATCH_N` | Upper bound for `n` in one generation request | `10` |
 | `MAX_UPLOAD_BYTES` | Per-file upload limit for edits/references | `52428800` (50 MB) |
 | `QUEUE_FULL_RETRY_AFTER_SEC` | `Retry-After` when the queue is full | `60` |
 | `RATE_LIMIT_COOLDOWN_MINUTES` | Cooldown after ChatGPT rate-limits the account — **reactive**, it arms only once ChatGPT has already refused | `30` |
-| `MIN_JOB_GAP_SEC` | **Proactive** pacing: minimum idle time between one **upstream turn** finishing and the next starting — a batch request of `n` images pays it `n-1` times, not once. Measured from the finish, not the start: a gap measured from the start does nothing when the turn itself runs longer than the gap, and these turns take a minute or more each. Waiting happens inside the queue slot (so a waiting request keeps its place and callers see ordinary `queue_full` backpressure) and beats a heartbeat, so a deliberate pause is not mistaken for a hang. `0` disables pacing. Current state is visible in `GET /v1/images/status` under `pacing` | `60` |
+| `MIN_JOB_GAP_SEC` | **Proactive** pacing, **per tab**: minimum idle time between one **upstream turn** on that tab finishing and the next one on the same tab starting — a batch request of `n` images pays it `n-1` times, not once. Measured from the finish, not the start: a gap measured from the start does nothing when the turn itself runs longer than the gap, and these turns take a minute or more each. Waiting happens inside the slot (so a waiting request keeps its place and callers see ordinary `queue_full` backpressure) and beats a heartbeat, so a deliberate pause is not mistaken for a hang. `0` disables pacing. Current state is visible in `GET /v1/images/status` under `pacing` | `60` |
 | `GENERATION_TIMEOUT_SEC` | First wait window for an image | `240` |
 | `GENERATION_RETRY_TIMEOUT_SEC` | Size of one adaptive extension, granted only while the page shows live generation progress (stop button / "creating image") | `90` |
 | `GENERATION_MAX_TIMEOUT_SEC` | Hard ceiling for the whole image wait (first window + all extensions). Keep ≤ your proxy read timeout | `600` |
@@ -362,8 +364,8 @@ The value is refreshed by every request and, independently of traffic, by a
 watchdog every `SESSION_WATCHDOG_INTERVAL_SEC`. The watchdog is read-only: it
 issues the same `GET /api/auth/session` the app already makes, from the page
 that is already open — it never navigates, clicks, clears cookies or logs in.
-It skips a tick entirely while a job is queued or a login is in flight, so it
-cannot interleave with a request.
+It skips a tick while the pool is not empty (a job is running or waiting) or a
+manual login holds the browser, so it cannot interleave with a request.
 
 **When it fires**, check the pod log for `[auto-login] BLOCKED by <blocker>` and
 the artifacts in `auth/diag/`: each failed login writes
@@ -391,9 +393,13 @@ session and then fail to log back in, since a clean login is what Turnstile bloc
 
 ## Limitations
 
-- **One request at a time.** The gateway serializes work through a single
-  browser session (queue up to `MAX_QUEUE_SIZE`). It is a personal/team
-  gateway, not a high-throughput proxy.
+- **A few tabs, not a farm.** Up to `MAX_CONCURRENT_JOBS` jobs run at once
+  (1..5, default 3), each on its own browser tab, in FIFO order. Further jobs
+  wait, and `MAX_QUEUE_SIZE` caps that waiting list. Each tab keeps its own
+  `MIN_JOB_GAP_SEC` after a turn finishes. A shared cooldown still stops every
+  tab when ChatGPT rate-limits the account. `MIN_TURN_STAGGER_SEC` spaces the
+  moments tabs start a turn. It is a personal/team gateway, not a
+  high-throughput proxy.
 - **Streaming needs backend-api reading.** `stream: true` works only while
   `READ_VIA_BACKEND_API` is enabled (the default; see "Advanced features");
   images do not stream.

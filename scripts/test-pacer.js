@@ -326,7 +326,66 @@ add('a stalled clock still releases a stagger wait', async () => {
   });
   assert.strictEqual(await gate.gate(0), 0);
   assert.strictEqual(await gate.gate(0), 10000);
-  assert.deepStrictEqual(slept, [10000]);
+  assert.strictEqual(await gate.gate(0), 20000);
+  assert.deepStrictEqual(slept, [10000, 10000, 10000]);
+});
+
+add('an early timer does not release the stagger before it is due', async () => {
+  const stagger = 40;
+  const gate = createTurnGate({
+    slots: 2,
+    gap: 0,
+    stagger,
+    heartbeatMs: 1000,
+    sleep: (ms) => new Promise((resolve) => {
+      setTimeout(resolve, Math.max(1, Math.floor(ms / 4)));
+    }),
+  });
+  await gate.gate(0);
+  // The next call is entered a millisecond or two after the previous release,
+  // so the remaining wait reads short of the full stagger. Five milliseconds
+  // is timer resolution. The early wake is a quarter of the stagger.
+  for (let i = 0; i < 20; i += 1) {
+    const started = Date.now();
+    await gate.gate(i % 2);
+    const interval = Date.now() - started;
+    assert.ok(interval >= stagger - 5, `interval ${interval} < ${stagger}`);
+  }
+});
+
+add('a stagger heartbeat receives the waiting slot id', async () => {
+  const beats = [];
+  let t = 0;
+  const gate = createTurnGate({
+    slots: 2,
+    now: () => t,
+    sleep: (ms) => { t += ms; return Promise.resolve(); },
+    gap: 0,
+    stagger: 10000,
+    heartbeat: (slotId) => beats.push(slotId),
+    heartbeatMs: 10000,
+  });
+  await Promise.all([gate.gate(0), gate.gate(1)]);
+  assert.ok(beats.length > 0);
+  assert.ok(beats.every((slotId) => slotId === 1), `beats ${beats}`);
+});
+
+add('a per-slot gap heartbeat receives that slot id', async () => {
+  const beats = [];
+  let t = 0;
+  const gate = createTurnGate({
+    slots: 2,
+    now: () => t,
+    sleep: (ms) => { t += ms; return Promise.resolve(); },
+    gap: 25000,
+    stagger: 0,
+    heartbeat: (slotId) => beats.push(slotId),
+    heartbeatMs: 10000,
+  });
+  await gate.gate(1);
+  gate.finished(1);
+  await gate.gate(1);
+  assert.deepStrictEqual(beats, [1, 1, 1]);
 });
 
 add('stagger 0 does not delay a turn', async () => {
@@ -372,6 +431,7 @@ add('MIN_TURN_STAGGER_SEC defaults to 10s, 0 disables, nonsense warns', () => {
   assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '0' }), 0);
   assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '2' }), 2000);
   assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '1.5' }), 1500);
+  assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '   ' }), DEFAULT_STAGGER_MS);
   const warned = [];
   const real = console.warn;
   console.warn = (msg) => warned.push(String(msg));

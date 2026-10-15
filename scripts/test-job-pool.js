@@ -276,7 +276,7 @@ add('a maintenance failure rejects only that call and the pool keeps running', a
   const caught = await failed.then(() => null, (error) => error);
   assert.strictEqual(caught.message, 'boom');
   assert.strictEqual(pool.status().epoch, 1);
-  assert.strictEqual(await pool.submit(async () => 'ok'), 'ok');
+  assert.strictEqual(await withTimeout(pool.submit(async () => 'ok'), 1000, 'after failed maintenance'), 'ok');
   assert.deepStrictEqual(
     await pool.requestMaintenance('next', async () => 'after'),
     { skipped: false, value: 'after' },
@@ -350,14 +350,34 @@ add('a requeued job does not count against maxWaiting', async () => {
   assert.deepStrictEqual(await Promise.all([a, b]), ['a', 'b']);
 });
 
-add('retry waits for maintenance before the same job starts again', async () => {
-  const pool = createJobPool({ concurrency: 1, maxWaiting: 5 });
+add('a retry marker without maintenance does not wait forever', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 2 });
   const seen = [];
-  let release;
   const job = pool.submit(async ({ epoch }) => {
     seen.push(epoch);
     if (seen.length === 1) {
-      await new Promise((resolve) => { release = resolve; });
+      const err = new Error('again');
+      err.retryAfterMaintenance = true;
+      throw err;
+    }
+    return 'done';
+  });
+  const other = pool.submit(async () => 'other');
+  assert.strictEqual(await withTimeout(job, 1000, 'unheld retry'), 'done');
+  assert.strictEqual(await withTimeout(other, 1000, 'after unheld retry'), 'other');
+  assert.deepStrictEqual(seen, [0, 0]);
+});
+
+add('a retry marker with maintenance waits until the epoch grows', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 5 });
+  const seen = [];
+  let releaseJob;
+  let releaseMaint;
+  const job = pool.submit(async ({ epoch }) => {
+    seen.push(epoch);
+    if (seen.length === 1) {
+      await new Promise((resolve) => { releaseJob = resolve; });
+      pool.requestMaintenance('reset', () => new Promise((resolve) => { releaseMaint = resolve; }));
       const err = new Error('later');
       err.retryAfterMaintenance = true;
       throw err;
@@ -366,13 +386,125 @@ add('retry waits for maintenance before the same job starts again', async () => 
   });
   const other = pool.submit(async () => 'other');
   await flush();
-  release();
+  releaseJob();
   await flush();
   assert.deepStrictEqual(seen, [0]);
-  assert.strictEqual(await other, 'other');
-  await pool.requestMaintenance('reset', async () => 'serviced');
-  assert.strictEqual(await job, 'done');
+  assert.strictEqual(pool.status().maintenance.active, 'reset');
+  let otherDone = false;
+  other.then(() => { otherDone = true; });
+  await flush();
+  assert.strictEqual(otherDone, false);
+  assert.deepStrictEqual(seen, [0]);
+  releaseMaint();
+  assert.deepStrictEqual(
+    await withTimeout(Promise.all([job, other]), 1000, 'held retry'),
+    ['done', 'other'],
+  );
   assert.deepStrictEqual(seen, [0, 1]);
+});
+
+add('a later job of the same conversation does not pass a retry', async () => {
+  const pool = createJobPool({ concurrency: 2, maxWaiting: 5 });
+  const order = [];
+  let release;
+  const a1 = pool.submit(async () => {
+    if (!order.includes('a1')) {
+      order.push('a1');
+      await new Promise((resolve) => { release = resolve; });
+      const err = new Error('again');
+      err.retryAfterMaintenance = true;
+      throw err;
+    }
+    order.push('a1-retry');
+  }, { key: 'conv' });
+  await flush();
+  const a2 = pool.submit(async () => { order.push('a2'); }, { key: 'conv' });
+  const b = pool.submit(async () => { order.push('b'); });
+  await flush();
+  assert.deepStrictEqual(order, ['a1', 'b']);
+  release();
+  await withTimeout(Promise.all([a1, a2, b]), 1000, 'same key');
+  assert.deepStrictEqual(order, ['a1', 'b', 'a1-retry', 'a2']);
+});
+
+add('maxWaiting 0 admits a job that can start immediately', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 0 });
+  assert.strictEqual(pool.isFull(), false);
+  let release;
+  const first = pool.submit(() => new Promise((resolve) => { release = resolve; }));
+  await flush();
+  assert.strictEqual(pool.status().running, 1);
+  assert.strictEqual(pool.isFull(), true);
+  assert.throws(() => pool.submit(async () => 'no'), (err) => err && err.code === 'queue_full');
+  release();
+  await first;
+  assert.strictEqual(pool.isFull(), false);
+  assert.strictEqual(await pool.submit(async () => 'yes'), 'yes');
+});
+
+add('maxWaiting 0 refuses while maintenance is active', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 0 });
+  const hold = pool.acquireExclusive('login');
+  await flush();
+  const releaseHold = await hold;
+  assert.strictEqual(pool.isFull(), true);
+  assert.throws(() => pool.submit(async () => 'no'), (err) => err && err.code === 'queue_full');
+  releaseHold();
+  await flush();
+  assert.strictEqual(pool.isFull(), false);
+});
+
+add('two pending exclusives behind a job do not merge', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 5 });
+  let release;
+  const blocker = pool.submit(() => new Promise((resolve) => { release = resolve; }));
+  await flush();
+  const first = pool.acquireExclusive('login');
+  const second = pool.acquireExclusive('login');
+  assert.notStrictEqual(first, second);
+  assert.deepStrictEqual(pool.status().maintenance.pending, ['login', 'login']);
+  release();
+  await blocker;
+  const release1 = await first;
+  release1();
+  const release2 = await second;
+  release2();
+  assert.strictEqual(pool.status().epoch, 2);
+});
+
+add('two waiters of a busy key stay in submission order', async () => {
+  const pool = createJobPool({ concurrency: 2, maxWaiting: 5 });
+  const order = [];
+  let release;
+  const a1 = pool.submit(async () => {
+    order.push('a1');
+    await new Promise((resolve) => { release = resolve; });
+  }, { key: 'a' });
+  await flush();
+  const a2 = pool.submit(async () => { order.push('a2'); }, { key: 'a' });
+  const a3 = pool.submit(async () => { order.push('a3'); }, { key: 'a' });
+  release();
+  await Promise.all([a1, a2, a3]);
+  assert.deepStrictEqual(order, ['a1', 'a2', 'a3']);
+});
+
+add('issued slotId is the slot status reports as busy', async () => {
+  const pool = createJobPool({ concurrency: 2, maxWaiting: 5 });
+  const seen = [];
+  const releases = [];
+  const jobs = [0, 1].map(() => pool.submit(async (ctx) => {
+    seen.push(ctx);
+    await new Promise((resolve) => releases.push(resolve));
+  }));
+  await flush();
+  assert.strictEqual(seen.length, 2);
+  for (const ctx of seen) {
+    const slot = pool.status().slots.find((item) => item.jobId === ctx.jobId);
+    assert.ok(slot, ctx.jobId);
+    assert.strictEqual(ctx.slotId, slot.slotId);
+  }
+  releases.forEach((release) => release());
+  await Promise.all(jobs);
 });
 
 add('two acquireExclusive calls do not share a release', async () => {
@@ -493,6 +625,14 @@ add('status reports slots, the job id and the epoch seen by the job', async () =
   assert.notStrictEqual(nextId, seen.jobId);
 });
 
+let finished = false;
+process.on('beforeExit', () => {
+  if (!finished) {
+    console.error('runner stopped before every test finished');
+    process.exit(1);
+  }
+});
+
 (async () => {
   for (const [name, fn] of tests) {
     try {
@@ -505,5 +645,6 @@ add('status reports slots, the job id and the epoch seen by the job', async () =
     }
   }
   console.log(`\n${passed}/${tests.length} passed`);
+  finished = true;
   process.exit(passed === tests.length ? 0 : 1);
 })();

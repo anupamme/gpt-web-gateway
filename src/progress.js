@@ -55,6 +55,11 @@ function createProgress(now = Date.now) {
       runningJobs.set(jobId, now());
       state.lastProgressAt = now();
     },
+    // Head-of-queue return: the job is no longer running, but it is not done.
+    // queueSize and the infra streaks stay as they were.
+    jobRequeued(jobId) {
+      runningJobs.delete(jobId);
+    },
     jobFinished(errorKind = null, jobId) {
       state.queueSize = Math.max(0, state.queueSize - 1);
       state.lastProgressAt = now();
@@ -88,14 +93,17 @@ function createProgress(now = Date.now) {
     // Liveness verdict. { alive, reason }
     liveness() {
       const msSince = now() - state.lastProgressAt;
-      if (state.queueSize > 0 && msSince > HEALTH_STUCK_MS) {
-        return { alive: false, reason: `queued work but no progress for ${Math.round(msSince / 1000)}s` };
-      }
+      // One wedged tab must fail before the shared queue does. A neighbor's
+      // poll keeps lastProgressAt fresh, and a finish without an id refreshes
+      // it too — neither of those clears a stuck job.
       for (const [id, at] of runningJobs) {
         const jobMs = now() - at;
         if (jobMs > HEALTH_STUCK_MS) {
           return { alive: false, reason: `job ${id} no progress for ${Math.round(jobMs / 1000)}s` };
         }
+      }
+      if (state.queueSize > 0 && msSince > HEALTH_STUCK_MS) {
+        return { alive: false, reason: `queued work but no progress for ${Math.round(msSince / 1000)}s` };
       }
       if (state.consecutiveInfraFailures >= HEALTH_FAILURE_STREAK) {
         return { alive: false, reason: `${state.consecutiveInfraFailures} consecutive infra failures` };

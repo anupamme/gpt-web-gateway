@@ -175,8 +175,29 @@ function cooldownMs(env = process.env) {
 // so this deliberately survives page and browser-context rebuilds; only time or a verified
 // selection clears it.
 const unavailable = new Map(); // mode -> { until, reason }
-const strikes = new Map();     // mode -> { reason, count } — evidence toward memoizing
+const strikes = new Map();     // `${mode}\0${slotId}` -> { reason, count }
 const fallbacks = new Map();   // "from>to" -> count
+
+// Consecutive observations are per tab. Two slots watching the same tier must not
+// add their failures together, and one slot's success at selecting it must not
+// wipe the other's series. The memo itself stays account-wide.
+function strikeKey(mode, slotId) {
+  const id = Number.isInteger(slotId) ? slotId : 0;
+  return `${mode}\0${id}`;
+}
+
+function slotIdFrom(opts) {
+  if (Number.isInteger(opts)) return opts;
+  if (opts && Number.isInteger(opts.slotId)) return opts.slotId;
+  return 0;
+}
+
+function clearStrikes(mode) {
+  const prefix = `${mode}\0`;
+  for (const key of [...strikes.keys()]) {
+    if (key.startsWith(prefix)) strikes.delete(key);
+  }
+}
 
 const tierAvailability = {
   markUnavailable(mode, reason, { env = process.env, now = Date.now() } = {}) {
@@ -190,29 +211,33 @@ const tierAvailability = {
   // would downgrade every Pro request for a quarter of an hour over one flake (Codex review).
   // Absence of the item is nearly as weak on its own: the menu counts as "open" at two
   // visible levels, so an incomplete render looks exactly like a missing tier.
-  noteUnavailable(mode, reason, { stickyAfter = 1, env = process.env, now = Date.now() } = {}) {
+  noteUnavailable(mode, reason, opts = {}) {
+    const { stickyAfter = 1, env = process.env, now = Date.now() } = opts;
+    const slotId = slotIdFrom(opts);
     // A reason that never memoizes still BREAKS the streak — "consecutive" has to mean
     // consecutive. Returning early here made not-offered → click-not-applied → not-offered
     // count as two agreeing observations (Codex review).
+    const key = strikeKey(mode, slotId);
     if (!Number.isFinite(stickyAfter)) {
-      strikes.delete(mode);
+      strikes.delete(key);
       return 0;
     }
-    const prev = strikes.get(mode);
+    const prev = strikes.get(key);
     const count = prev && prev.reason === reason ? prev.count + 1 : 1;
-    strikes.set(mode, { reason, count });
+    strikes.set(key, { reason, count });
     if (count >= stickyAfter) this.markUnavailable(mode, reason, { env, now });
     return count;
   },
-  strikesFor(mode) {
-    const entry = strikes.get(mode);
+  strikesFor(mode, opts) {
+    const entry = strikes.get(strikeKey(mode, slotIdFrom(opts)));
     return entry ? entry.count : 0;
   },
   // A verified selection is proof the tier is back — clear the memo immediately rather
   // than making the caller wait out a cooldown that reality has already invalidated.
+  // Every slot's series for this tier goes with it: the memo is account-wide.
   markAvailable(mode) {
     unavailable.delete(mode);
-    strikes.delete(mode);
+    clearStrikes(mode);
   },
   isCoolingDown(mode, { now = Date.now() } = {}) {
     const entry = unavailable.get(mode);
@@ -221,7 +246,7 @@ const tierAvailability = {
       unavailable.delete(mode);
       // Evidence expires with the memo: a fresh window needs fresh confirmations, otherwise
       // one sighting after every expiry re-blocks the tier forever.
-      strikes.delete(mode);
+      clearStrikes(mode);
       return false;
     }
     return true;

@@ -1,10 +1,74 @@
 const { Router } = require('express');
 const { getContext, saveSession, maybeHideWebdriverOnPage } = require('../browser');
-const { resetPage } = require('../chatgpt');
+const { resetAllSlotPages, getPoolHooks } = require('../chatgpt');
+const { progress } = require('../progress');
 
 const router = Router();
 
 let loginPage = null;
+
+// One manual-login capture for every /login/* caller. Parallel requests wait
+// on the same acquireExclusive promise and share its release. /login/save and
+// ten minutes without a /login/* call drop it. The timer re-arms on each call.
+const LOGIN_IDLE_MS = 10 * 60 * 1000;
+let loginHold = null;
+
+function releaseLoginHold() {
+  const attempt = loginHold;
+  if (!attempt) return;
+  loginHold = null;
+  if (attempt.timer) clearTimeout(attempt.timer);
+  if (typeof attempt.release === 'function') {
+    try {
+      attempt.release();
+    } catch (err) {
+      console.log(`[login] release failed: ${err && err.message ? err.message : err}`);
+    }
+  }
+}
+
+function armLoginIdle() {
+  if (!loginHold) return;
+  if (loginHold.timer) clearTimeout(loginHold.timer);
+  loginHold.timer = setTimeout(() => {
+    console.log('[login] idle 10min — releasing manual-login hold');
+    releaseLoginHold();
+  }, LOGIN_IDLE_MS);
+  if (typeof loginHold.timer.unref === 'function') loginHold.timer.unref();
+}
+
+async function enterManualLogin() {
+  progress.touch();
+  if (loginHold) {
+    armLoginIdle();
+    await loginHold.acquired;
+    return;
+  }
+  const hooks = getPoolHooks();
+  if (!hooks || typeof hooks.acquireExclusive !== 'function') {
+    const err = new Error('pool hooks not set');
+    err.code = 'server_error';
+    throw err;
+  }
+  const acquired = hooks.acquireExclusive('manual-login');
+  const attempt = { acquired, release: null, timer: null };
+  loginHold = attempt;
+  armLoginIdle();
+  try {
+    const release = await acquired;
+    if (loginHold !== attempt) {
+      if (typeof release === 'function') release();
+      return;
+    }
+    attempt.release = release;
+  } catch (err) {
+    if (loginHold === attempt) {
+      if (attempt.timer) clearTimeout(attempt.timer);
+      loginHold = null;
+    }
+    throw err;
+  }
+}
 
 async function getLoginPage() {
   if (loginPage && !loginPage.isClosed()) return loginPage;
@@ -16,7 +80,12 @@ async function getLoginPage() {
 }
 
 // Remote login page
-router.get('/login', (req, res) => {
+router.get('/login', async (req, res) => {
+  try {
+    await enterManualLogin();
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
   res.send(`<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
@@ -115,6 +184,7 @@ router.get('/login', (req, res) => {
 // Screenshot
 router.get('/login/screenshot', async (req, res) => {
   try {
+    await enterManualLogin();
     const p = await getLoginPage();
     const buffer = await p.screenshot({ type: 'jpeg', quality: 80 });
     res.set('Content-Type', 'image/jpeg');
@@ -128,6 +198,7 @@ router.get('/login/screenshot', async (req, res) => {
 // Click
 router.post('/login/click', async (req, res) => {
   try {
+    await enterManualLogin();
     const { x, y } = req.body;
     const p = await getLoginPage();
     await p.mouse.click(x, y);
@@ -140,6 +211,7 @@ router.post('/login/click', async (req, res) => {
 // Type text
 router.post('/login/type', async (req, res) => {
   try {
+    await enterManualLogin();
     const { text } = req.body;
     const p = await getLoginPage();
     await p.keyboard.type(text, { delay: 30 });
@@ -152,6 +224,7 @@ router.post('/login/type', async (req, res) => {
 // Press key
 router.post('/login/key', async (req, res) => {
   try {
+    await enterManualLogin();
     const { key } = req.body;
     const p = await getLoginPage();
     await p.keyboard.press(key);
@@ -171,6 +244,7 @@ const LOGIN_NAV_URL = 'https://chatgpt.com';
 
 router.post('/login/navigate', async (req, res) => {
   try {
+    await enterManualLogin();
     const p = await getLoginPage();
     await p.goto(LOGIN_NAV_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     res.json({ ok: true, url: LOGIN_NAV_URL });
@@ -182,14 +256,16 @@ router.post('/login/navigate', async (req, res) => {
 // Save session
 router.post('/login/save', async (req, res) => {
   try {
+    await enterManualLogin();
     await saveSession();
     // Close login page
     if (loginPage && !loginPage.isClosed()) {
       await loginPage.close();
       loginPage = null;
     }
-    // Reset main chatgpt page so it reloads with new session
-    resetPage();
+    // Session changed: no tab may keep a document from before the login.
+    resetAllSlotPages();
+    releaseLoginHold();
     res.json({ message: 'Session saved! Main page reset. You can now use the API.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
