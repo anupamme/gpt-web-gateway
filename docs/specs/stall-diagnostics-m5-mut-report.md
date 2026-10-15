@@ -4,7 +4,7 @@
 
 Всего 54 мутации по строкам, которые M5 добавила или изменила в `src/chatgpt.js`, `src/routes/images.js`, `src/server.js`, `src/log-context.js`: **убито 40, выжило 13, невалидных 1**.
 
-Из 13 выживших 6 эквивалентны исходному коду (M01, M04, M05, M21, M48, M54). Семь меняют поведение, и тесты этого не видят: M03, M15, M41, M45, M49, M50, M51.
+Из 13 выживших 5 эквивалентны исходному коду (M01, M04, M05, M48, M54). Восемь меняют поведение, и тесты этого не видят: M03, M15, M21, M41, M45, M49, M50, M51.
 
 ## Методика
 
@@ -38,7 +38,7 @@
 | M18 | src/chatgpt.js | `cap.postFailure = failure` перенесён на место после `await` тела | POST failure is published before reading the body | убит | AssertionError: snippet `''` !== `Too many requests` — scripts/test-stall-diagnostics.js:151 |
 | M19 | src/chatgpt.js | таймер непрочитанного тела 5000 заменён на 5001 | unread POST body has a bounded single diagnostic | убит | AssertionError: нет `body=<unread>` — scripts/test-stall-diagnostics.js:169 |
 | M20 | src/chatgpt.js | коды 429 и не-429 поменяны местами: `server_error` / `rate_limit` | POST failure is published before reading the body | убит | AssertionError: rejects validation returned false — scripts/test-stall-diagnostics.js:147 |
-| M21 | src/chatgpt.js | `if (onSubmitted) onSubmitted();` убран | оба stall-теста и npm test | эквивалент | — |
+| M21 | src/chatgpt.js | `if (onSubmitted) onSubmitted();` убран | оба stall-теста и npm test | выжил | — |
 | M22 | src/chatgpt.js | присваивание `err.modelMessage` убрано | POST failure is published before reading the body | убит | AssertionError: rejects validation returned false (`modelMessage` не `''`) — scripts/test-stall-diagnostics.js:147 |
 | M23 | src/chatgpt.js | текст `' rate limit'` в сообщении POST убран | POST failure is published before reading the body | убит | AssertionError: rejects validation returned false (нет `/rate limit/`) — scripts/test-stall-diagnostics.js:147 |
 | M24 | src/chatgpt.js | фильтр кольца `at >= startedAt` заменён на `at > startedAt` | backend ring is per slot | убит | AssertionError: diag `none` вместо пути с `<id>` — scripts/test-stall-diagnostics.js:229 |
@@ -87,10 +87,6 @@
 
 `postAccepted` становится истинным только вместе с `postStatus.status` в диапазоне 2xx. Более поздний не-2xx ответ записывает `postFailure`, и `throwBackendPostFailure` бросает ошибку раньше присваивания флага. Пока проверка диапазона `postStatus` на месте, отдельное выключение `postAccepted` (M05) и отказ ставить его ровно на статусе 200 (M54) дают тот же `stallNoAnswer`.
 
-### M21. `onSubmitted()` внутри `throwBackendPostFailure`
-
-Вызов помечает попытку как уже отправленную. Функция бросает только `rate_limit` или `server_error`. Оба кода не входят в transient-повтор `completeText`, сообщение не похоже на logout, и локальный `submitted` после этого не читается: catch сразу делает `throw err`. Наблюдаемого отличия нет.
-
 ### M48. `return` у `onBackendResponse`
 
 Единственный вызов — `p.on('response', …)`, возвращаемое значение не читается. IIFE по-прежнему запускается, и `.catch` висит на ней же.
@@ -104,6 +100,10 @@
 ### M15. `recordSlotJobFinished` на requeue
 
 Инкремент в `finally` происходит до обслуживания. Обработчик теста вызывает `resetAllSlotPages`, а `discardSlotPage` обнуляет `completedJobs`. К ассерту `completedJobs === 1` и мутант, и исходный код приходят с одним значением. Если обслуживание страницу не выбрасывает, лишний инкремент остаётся.
+
+### M21. `onSubmitted()` внутри `throwBackendPostFailure`
+
+Функция бросает `rate_limit` или `server_error`. Сами по себе эти коды не входят в transient-повтор, и на таком пути `submitted` не читается. Сниппет тела входит в текст ошибки. POST 503 до появления пользовательского хода, с телом `content failed to load`, остаётся `server_error`, и тот же текст удовлетворяет проверке `content failed to load` в `completeText`. Ошибка становится transient. Вызов `onSubmitted()` ставит `submitted` до броска, повтор не выполняется, send остаётся один. Без вызова подтверждения в DOM не было, `submitted` ложен. При лимите попыток больше одного это не последняя попытка: `resetPage` и промпт отправляется снова. Отдельный прогон на фикстуре `unconfirmed`, POST 503, тело `content failed to load`, `CHATGPT_TEXT_RETRY_ATTEMPTS=4`: исходник — отказ `server_error` и 1 send; мутант — 2 send и успешный ответ со свежей страницы. Тест 429 такую фразу в тело не кладёт, stall-тесты и `npm test` остаются зелёными.
 
 ### M41. `ensureNewChat` после stall-повтора
 
@@ -119,7 +119,7 @@
 
 ### M50. Повторная установка ALS-обёртки
 
-`if (true)` вешает обёртку при каждой оценке модуля. `require` кэширует `log-context.js`, тесты кэш этого модуля не сбрасывают, поэтому тело выполняется один раз. Повторная загрузка даст префикс `[sN] [sN]`. Ассерт на двойной префикс есть, двойной загрузки нет.
+`Object.defineProperty(console, key, { value: storage })` создаёт неконфигурируемое свойство. `if (!console[key])` при повторной оценке модуля пропускает блок. `if (true)` входит в него снова и падает на `TypeError: Cannot redefine property: Symbol(gpt-web-gateway.log-context)` раньше цикла, который подменяет `console.log`. Второй обёртки нет и префикса `[sN] [sN]` нет. Повторный `require` исходного модуля проходит. Ассерт на двойной префикс смотрит один прогон, где модуль оценивается один раз: `require` кэширует `log-context.js`, а сброс кэша в маршрутных тестах касается роутера, не этого модуля.
 
 ### M51. `.trim()` в `safeNonNegativeInt`
 

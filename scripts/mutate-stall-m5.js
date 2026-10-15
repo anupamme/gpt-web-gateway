@@ -526,6 +526,10 @@ function restoreAll() {
 }
 
 let mutated = false;
+// Node 24's default SIGTERM and SIGINT already emit `exit`, including while
+// spawnSync is blocked, so this hook restores the files. A listener would
+// remove that default and does not run during spawnSync: the signal is then
+// swallowed until the child returns.
 process.on('exit', () => {
   if (!mutated) return;
   try { restoreAll(); } catch (err) { console.error(err); }
