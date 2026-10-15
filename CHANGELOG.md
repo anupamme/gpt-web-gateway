@@ -1,21 +1,35 @@
 # Changelog
 
-## Unreleased
+## 2.16.0 — 2026-10-15
 
-- Recheck backend POST results after submit diagnostics to avoid duplicate sends;
-  discard screenshots arriving after their deadline so retention stays consistent.
-- Confirm text submission from accepted backend POSTs even when the DOM stalls;
-  ignore responses from replaced pages. Bound snapshot reads and serialize stall
-  snapshot saves with retention; cover late diagnostic bodies across turns.
-- Diagnose backend conversation POST/GET responses per slot, fail promptly on
-  rejected POSTs, and log recent backend traffic on rescue/stall. Stall snapshots
-  are enabled separately from debug snapshots and retained with a bounded history.
-- Retry a text stall once on a fresh page only when no answer, stream or accepted
-  POST was observed. Preserve the job's retry budget through maintenance and
-  apply the slot's finish gap before resending.
-- Prefix job logs with their slot via AsyncLocalStorage and omit `GET /` access logs.
-- Recycle each slot's page after 50 completed jobs by default, without entering
-  recovery probation or suppressing idle session checks.
+About 15% of text jobs have stalled since 2026-10-14 ~21:00 UTC: the prompt is
+sent, nothing is rendered, and the client gets a 504 after ~280 s. The cause is
+not visible in the logs, so this release adds diagnostics and a guarded retry.
+
+- Diagnostics. The response to the conversation POST is logged per slot when it
+  is not a 2xx event stream (`[backend-read] slot=N conversation POST status=…
+  body="…"`), and so is the conversation GET after a rescue reload. A rejected
+  POST now fails the job at once: 429 → `rate_limit`, other statuses →
+  `server_error`, instead of waiting out the stall window. Rescue and stall
+  log every backend-api response of the turn (`[stall-diag]`).
+- Stall snapshots (`STALL_SNAPSHOTS`, default on; `STALL_SNAPSHOT_KEEP`, default
+  20) save screenshot + HTML before the rescue reload and at stall abort,
+  independently of `DEBUG_SNAPSHOTS`. They may contain prompts. Reads are
+  bounded at 5 s and saves are serialized with retention.
+- A text job that stalls with no sign of generation (no answer, no stream, no
+  accepted POST) is resent once on a fresh page (`TEXT_STALL_RETRIES`, default
+  1). Never for a `conversation_id` continuation or after streaming started;
+  the budget belongs to the job and survives maintenance; slot pacing applies.
+- A 2xx conversation POST now counts as a confirmed send even if the DOM never
+  shows the user turn, so such a turn is no longer resent. Responses from a
+  page that was already replaced are ignored.
+- Job log lines carry a `[sN]` slot prefix; `GET /` (uptime probes) is no longer
+  access-logged.
+- Each slot's page is recreated after `PAGE_RECYCLE_AFTER_JOBS` jobs (default
+  50) without entering recovery probation: one page was seen growing the pod
+  from 2 to 6.3 GiB over 766 turns.
+- `scripts/release.sh` pushes the tag, waits for CI and the image, then pushes
+  main, so a release no longer takes the service down for the image build.
 
 ## 2.15.1 — 2026-10-15
 
