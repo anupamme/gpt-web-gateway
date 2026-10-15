@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.15.1 — 2026-10-15
 
 - Express 4 → 5.3.0. Routes use no wildcard/optional paths and never write
   `req.query`, so they work unchanged.
