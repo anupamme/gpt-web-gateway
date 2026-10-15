@@ -41,7 +41,12 @@ class Page extends EventEmitter {
   async exposeFunction(name, fn) { this.bindings[name] = fn; }
   async addInitScript() {}
   async waitForTimeout(ms) { this.clock.now += ms; }
-  async screenshot({ path: file }) { this.actions.push('snapshot'); fs.writeFileSync(file, 'png'); }
+  async screenshot({ path: file }) {
+    this.actions.push('snapshot');
+    const png = Buffer.from('png');
+    if (file) fs.writeFileSync(file, png);
+    return png;
+  }
   async content() { return '<html>snapshot</html>'; }
   async send() {
     this.sends++;

@@ -1581,7 +1581,8 @@ async function saveDebugSnapshot(p, label) {
       fs.mkdirSync(DEBUG_SNAPSHOT_DIR, { recursive: true });
       const ts = new Date(Date.now()).toISOString().replace(/[:.]/g, '-');
       const base = `${DEBUG_SNAPSHOT_DIR}/${ts}_s${slotOf(p).id}_${++snapshotSequence}_${label}`;
-      await raceDeadline(p.screenshot({ path: `${base}.png`, fullPage: true }), 5000).catch(() => {});
+      const png = await raceDeadline(p.screenshot({ fullPage: true }), 5000).catch(() => null);
+      if (Buffer.isBuffer(png)) fs.writeFileSync(`${base}.png`, png);
       const html = await raceDeadline(p.content(), 5000).catch(() => '');
       if (typeof html === 'string' && html) fs.writeFileSync(`${base}.html`, html);
       if (stall) pruneStallSnapshots();
@@ -2734,7 +2735,9 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     const err = new Error('Prompt submit not confirmed (no new user turn, composer unchanged)');
     err.code = 'page_load_failed';
     if (uiError) err.modelMessage = uiError;
-    throw err;
+    // Diagnostics yield to response hooks too: the POST may have completed meanwhile.
+    throwBackendPostFailure(capture, onSubmitted);
+    if (!capture?.postAccepted) throw err;
   }
   console.log(capture?.postAccepted ? 'Prompt submitted (confirmed) by backend POST.' : 'Prompt submitted (confirmed).');
   // Signal confirmed-send NOW, before the settle wait — a failure during the wait below must

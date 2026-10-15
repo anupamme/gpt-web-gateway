@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Recheck backend POST results after submit diagnostics to avoid duplicate sends;
+  discard screenshots arriving after their deadline so retention stays consistent.
 - Confirm text submission from accepted backend POSTs even when the DOM stalls;
   ignore responses from replaced pages. Bound snapshot reads and serialize stall
   snapshot saves with retention; cover late diagnostic bodies across turns.

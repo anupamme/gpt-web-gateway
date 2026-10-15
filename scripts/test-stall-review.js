@@ -60,6 +60,40 @@ test('D1: acceptance arriving at the submit deadline still calls onSubmitted', a
   });
 });
 
+for (const during of ['snapshot', 'error banner']) {
+  for (const status of [200, 429]) {
+    test(`R1: POST ${status} during submit ${during} prevents a duplicate send`, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stall-submit-race-'));
+      try {
+        await fixture({ DEBUG_SNAPSHOTS: '1', DEBUG_SNAPSHOT_DIR: dir, CHATGPT_TEXT_RETRY_ATTEMPTS: '4' },
+          async ({ chat, page, queue, pages }) => {
+            const p = page({ unconfirmed: true, answer: true }); queue.push(p);
+            const emit = () => p.emit('response', response({ status,
+              ct: status === 200 ? 'text/event-stream' : 'application/json' }));
+            if (during === 'snapshot') {
+              const screenshot = p.screenshot.bind(p);
+              p.screenshot = async options => { emit(); return screenshot(options); };
+            } else {
+              const evaluate = p.evaluate.bind(p);
+              p.evaluate = async (fn, ...args) => {
+                if (String(fn).includes('[role="alert"]')) emit();
+                return evaluate(fn, ...args);
+              };
+            }
+            const { output } = await logs(async () => {
+              const turn = chat.completeText('hello', { thinkingMode: 'instant' });
+              if (status === 200) assert.equal((await turn).text, 'answer');
+              else await assert.rejects(turn, e => e.code === 'rate_limit');
+            });
+            assert.equal(pages.length, 1, 'late POST must not authorize pre-submit retry');
+            assert.equal(p.sends, 1);
+            if (status === 200) assert.match(output, /Prompt submitted \(confirmed\).*backend/i);
+          });
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+}
+
 for (const hung of ['content', 'screenshot']) {
   test(`D2: hung ${hung} cannot hold stall-abort beyond its snapshot deadline`, async t => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stall-deadline-'));
@@ -181,5 +215,49 @@ test('D4: a failed snapshot does not poison the save queue', async () => {
       await chat._test.saveDebugSnapshot(page(), 'text_stalled');
       assert.equal(fs.readdirSync(dir).filter(f => f.includes('text_stalled')).length, 2);
     });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('R2: a screenshot resolved after its deadline cannot write an orphan PNG or break retention', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stall-late-png-'));
+  try {
+    await fixture({ STALL_SNAPSHOTS: '1', STALL_SNAPSHOT_KEEP: '1', DEBUG_SNAPSHOT_DIR: dir },
+      async ({ chat, page, clock }) => {
+        const late = page(); const started = deferred(); const image = deferred();
+        late.content = async () => '';
+        late.screenshot = async ({ path: file }) => {
+          started.resolve();
+          const png = await image.promise;
+          // Playwright writes to disk itself only when given a path.
+          if (file) fs.writeFileSync(file, png);
+          return png;
+        };
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        let settled = false;
+        const first = chat._test.saveDebugSnapshot(late, 'text_rescue').then(() => { settled = true; });
+        try {
+          await started.promise; await flush();
+          t.mock.timers.tick(5000); await flush();
+          assert.equal(settled, true, 'timed-out screenshot must release the save queue');
+          await first;
+          assert.deepEqual(fs.readdirSync(dir), [], 'no file for an expired screenshot without HTML');
+          clock.now += 1000;
+          await chat._test.saveDebugSnapshot(page(), 'text_stalled');
+          const retained = fs.readdirSync(dir).sort();
+          assert.equal(retained.length, 2);
+          assert.ok(retained[0].endsWith('_text_stalled.html'));
+          assert.ok(retained[1].endsWith('_text_stalled.png'));
+          image.resolve(Buffer.from('late png')); await flush();
+          assert.deepEqual(fs.readdirSync(dir).sort(), retained, 'late completion must not create an orphan PNG');
+          const broken = page();
+          broken.screenshot = async () => { throw new Error('closed page'); };
+          broken.content = async () => '';
+          await chat._test.saveDebugSnapshot(broken, 'text_rescue');
+          assert.deepEqual(fs.readdirSync(dir).sort(), retained, 'failed save must retain the newest complete pair');
+        } finally {
+          image.resolve(Buffer.from('late png')); await first; await flush();
+          t.mock.timers.reset();
+        }
+      });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

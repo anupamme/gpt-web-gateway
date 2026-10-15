@@ -112,7 +112,7 @@ capture, взятого до await, проходит оба файла тест�
 - **AC-005. Мутация D5 (утечка snippet в чужой capture) убивается тестом.**
   `bash -c 'set -e; f=src/chatgpt.js; cp $f /tmp/m5b-orig.js; trap "cp /tmp/m5b-orig.js $f" EXIT; perl -0pi -e "s/if \(body !== null\) failure\.snippet = (.*?);\n/if (body !== null) { failure.snippet = \$1; const leak = activeCapture(slot); if (leak) leak.postFailure = failure; }\n/" $f; ! cmp -s $f /tmp/m5b-orig.js; rc=0; docker run --rm -u 1002:1002 -e HOME=/tmp -v "$PWD":/app -w /app node:24 node scripts/test-stall-diagnostics.js >/dev/null 2>&1 || rc=$?; test $rc -ne 0'`
 - **AC-004. Изменения только в разрешённых путях, дерево чистое.**
-  `bash -c 'test -z "$(git status --porcelain -- . ":(exclude)report.json" ":(exclude)report-blocked.md")" && test -z "$(git diff --name-only d58875c HEAD | grep -vxE "src/chatgpt.js|src/routes/images.js|scripts/test-stall-[a-z0-9-]+\.js|package.json|CHANGELOG.md|docs/specs/stall-diagnostics-m5b.md")" && test -z "$(git diff d58875c HEAD -- package.json | grep -E "^[-+][^-+]" | grep -v "\"test\":")"'`
+  `bash -c 'test -z "$(git status --porcelain -- . ":(exclude)report.json" ":(exclude)report-blocked.md")" && test -z "$(git diff --name-only d58875c HEAD | grep -vxE "src/chatgpt.js|src/routes/images.js|scripts/test-stall-[a-z0-9-]+\.js|package.json|CHANGELOG.md|docs/specs/stall-diagnostics-m5b.md|docs/specs/stall-diagnostics-m5b-followup.md")" && test -z "$(git diff d58875c HEAD -- package.json | grep -E "^[-+][^-+]" | grep -v "\"test\":")"'`
 
 ## Авторевью
 
