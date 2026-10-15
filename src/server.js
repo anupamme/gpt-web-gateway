@@ -19,7 +19,7 @@ app.set('trust proxy', true);
 // Skipped for noisy/uninteresting paths (static, health, metrics).
 const ACCESS_LOG_SKIP = /^\/(health|metrics|favicon\.ico|images\/|index\.html|css\/|js\/)/;
 app.use((req, res, next) => {
-  if (ACCESS_LOG_SKIP.test(req.path)) return next();
+  if ((req.method === 'GET' && req.path === '/') || ACCESS_LOG_SKIP.test(req.path)) return next();
   req.id = crypto.randomBytes(4).toString('hex');
   req.startedAt = Date.now();
   const ct = (req.headers['content-type'] || '').split(';')[0];

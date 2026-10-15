@@ -7,7 +7,7 @@ const multer = require('multer');
 // disagree with the actual interception layer about the flag's default.
 const {
   generateImage, editImage, completeText, probeCapabilities, READ_VIA_BACKEND_API,
-  setPoolHooks,
+  setPoolHooks, recordSlotJobFinished,
 } = require('../chatgpt');
 const { parseBool, normalizeThinkingMode, parseThinkingMode, parseWebSearchRequested } = require('../params');
 const { isValidConversationId } = require('../lib/conversation-read');
@@ -15,6 +15,7 @@ const { createStreamEmitter } = require('../lib/sse-transform');
 const { progress } = require('../progress');
 const { createTurnGate, heartbeatMsFor } = require('../pacer');
 const { createJobPool, parseConcurrency } = require('../job-pool');
+const { runWithLogContext } = require('../log-context');
 const {
   incRequests, incGenerations, incEdits, incError, classifyError, incQueueFull,
   observeDuration, shouldRetryKind,
@@ -220,25 +221,29 @@ function assertNotRateLimited() {
 // finish; the second (or any other error) settles it exactly once.
 function submitJob(fn, { key } = {}) {
   let attempts = 0;
-  const promise = pool.submit(async (ctx) => {
+  const stallRetryState = { used: 0 };
+  const promise = pool.submit((ctx) => runWithLogContext({ slotId: ctx.slotId }, async () => {
     attempts += 1;
+    let requeued = false;
     jobIdBySlot.set(ctx.slotId, ctx.jobId);
     progress.jobRunning(ctx.jobId);
     try {
-      const value = await fn(ctx);
+      const value = await fn({ ...ctx, stallRetryState });
       progress.jobFinished(null, ctx.jobId);
       return value;
     } catch (err) {
       if (err && err.retryAfterMaintenance && attempts < 2) {
+        requeued = true;
         progress.jobRequeued(ctx.jobId);
         throw err;
       }
       progress.jobFinished(classifyError(err && err.message, err && err.code), ctx.jobId);
       throw err;
     } finally {
+      if (!requeued) recordSlotJobFinished?.(ctx.slotId);
       if (jobIdBySlot.get(ctx.slotId) === ctx.jobId) jobIdBySlot.delete(ctx.slotId);
     }
-  }, { key });
+  }), { key });
   progress.jobStarted();
   return promise;
 }
@@ -262,6 +267,13 @@ async function runTurn(ctx, invoke) {
   try {
     return await invoke({
       job: { slotId: ctx.slotId, jobId: ctx.jobId, epoch: ctx.epoch },
+      stallRetryState: ctx.stallRetryState,
+      onAttemptFinished: () => {
+        if (paced > 0) {
+          turnGate.finished(ctx.slotId);
+          paced -= 1;
+        }
+      },
       beforeSubmit: async () => {
         await turnGate.gate(ctx.slotId);
         assertNotRateLimited();
@@ -960,11 +972,13 @@ async function handleTextCompletion(req, res, prompt) {
   }
 
   try {
-    const result = await submitTextJob((ctx) => runTurn(ctx, ({ job, beforeSubmit }) => completeText(prompt, {
+    const result = await submitTextJob((ctx) => runTurn(ctx, ({ job, beforeSubmit, onAttemptFinished, stallRetryState }) => completeText(prompt, {
       thinkingMode,
       conversationId,
       job,
       beforeSubmit,
+      onAttemptFinished,
+      stallRetryState,
     })), conversationKey(conversationId));
 
     const applied = result.applied || { thinking: false, thinking_mode: 'instant' };
@@ -1056,11 +1070,13 @@ async function streamTextCompletion(res, prompt, { thinkingMode, webSearch, conv
   };
 
   try {
-    const result = await submitTextJob((ctx) => runTurn(ctx, ({ job, beforeSubmit }) => completeText(prompt, {
+    const result = await submitTextJob((ctx) => runTurn(ctx, ({ job, beforeSubmit, onAttemptFinished, stallRetryState }) => completeText(prompt, {
       thinkingMode,
       conversationId,
       job,
       beforeSubmit,
+      onAttemptFinished,
+      stallRetryState,
       // Called with the latest FULL text; the emitter turns it into append-only deltas.
       onDelta: (fullText) => {
         try {

@@ -295,6 +295,8 @@ Every endpoint returns a uniform error shape:
 | `CHAT_STALL_WINDOW_SEC` | Stuck-guard: extensions require page/text change within the last N s (×2 for thinking modes). A frozen page with a stop button is not "live" | `120` |
 | `CHAT_STREAM_RESCUE_SEC` | Grace window to rescue a response that is still streaming at the deadline | `60` |
 | `CHATGPT_TEXT_RETRY_ATTEMPTS` | Attempts for `page_load_failed` transients (fresh page → full browser rebuild) | `4` |
+| `TEXT_STALL_RETRIES` | Extra fresh-page resends per text job after a stall with no answer, bound stream, POST failure or accepted POST. Only new conversations before any client delta; budget survives maintenance. Requires backend capture. `0` disables. Each resend obeys slot pacing; a lost POST response can still cause duplicate generation | `1` |
+| `PAGE_RECYCLE_AFTER_JOBS` | Recreate a slot's page on the next job after this many completed jobs on that page. Does not enter recovery probation. `0` disables | `50` |
 | `CHATGPT_TEXT_HARD_RESET` | Allow full browser-context rebuild on repeated `page_load_failed` (auto-off in `cdp` mode) | `true` |
 | `HEALTH_STUCK_SEC` | Liveness: queued work without heartbeat for N s → `/health/live` 503 | `900` |
 | `HEALTH_FAILURE_STREAK` | Liveness: N consecutive infra failures → `/health/live` 503 (`refused`/`rate_limit` reset the streak) | `3` |
@@ -318,7 +320,9 @@ Every endpoint returns a uniform error shape:
 | `READ_VIA_BACKEND_API` | Read answers from intercepted backend-api traffic instead of DOM scraping (DOM stays the fallback). Required for `stream: true`; `0` = DOM-only | **on** |
 | `CONVERSATION_TRIM_LIMIT` | Trim reopened conversations to the last N messages of the active branch (`page.route()` rewrite; client-side load optimization, server context untouched). `0` = off | `0` |
 | `DISABLE_CHATGPT_MEMORY` | Disable ChatGPT account memory once at session start (unofficial settings PATCH, best-effort, **account-wide**) | off |
-| `DEBUG_SNAPSHOTS` | Dump screenshot+HTML on failures (`1`/`true`). Snapshots may contain prompts — opt-in | off |
+| `DEBUG_SNAPSHOTS` | Dump screenshot+HTML on other failures (`1`/`true`). Snapshots may contain prompts and history; stall snapshots are controlled separately | off |
+| `STALL_SNAPSHOTS` | Save screenshot+HTML before text rescue reload and on stall abort, independently of `DEBUG_SNAPSHOTS`. May contain prompts and history. `0` disables | `1` |
+| `STALL_SNAPSHOT_KEEP` | Maximum number of newest `text_rescue`/`text_stalled` snapshot pairs retained together in `DEBUG_SNAPSHOT_DIR` | `20` |
 | `DEBUG_SNAPSHOT_DIR` | Where to write debug snapshots | `/tmp/chatgpt-debug` |
 
 ## Deployment notes

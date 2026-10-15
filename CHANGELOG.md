@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Diagnose backend conversation POST/GET responses per slot, fail promptly on
+  rejected POSTs, and log recent backend traffic on rescue/stall. Stall snapshots
+  are enabled separately from debug snapshots and retained with a bounded history.
+- Retry a text stall once on a fresh page only when no answer, stream or accepted
+  POST was observed. Preserve the job's retry budget through maintenance and
+  apply the slot's finish gap before resending.
+- Prefix job logs with their slot via AsyncLocalStorage and omit `GET /` access logs.
+- Recycle each slot's page after 50 completed jobs by default, without entering
+  recovery probation or suppressing idle session checks.
+
 ## 2.15.1 — 2026-10-15
 
 - Express 4 → 5.3.0. Routes use no wildcard/optional paths and never write

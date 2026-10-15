@@ -27,6 +27,10 @@ function safePositiveInt(envValue, defaultValue) {
   const n = parseInt(envValue, 10);
   return Number.isFinite(n) && n > 0 ? n : defaultValue;
 }
+function safeNonNegativeInt(envValue, defaultValue) {
+  const n = Number(envValue);
+  return String(envValue ?? '').trim() && Number.isInteger(n) && n >= 0 ? n : defaultValue;
+}
 const GENERATION_TIMEOUT_MS = safePositiveInt(process.env.GENERATION_TIMEOUT_SEC, 240) * 1000;
 // Adaptive second-chance budget: applied only when first wait timed out AND we can
 // still observe an active generation indicator (stop-button / "Creating image…").
@@ -84,6 +88,8 @@ const CHAT_STALL_WINDOW_MS = safePositiveInt(process.env.CHAT_STALL_WINDOW_SEC, 
 // app-shell cache that survives in the browser context, so a fresh page alone won't help —
 // the catch block escalates to a full context rebuild (see TEXT_HARD_RESET_ENABLED).
 const CHATGPT_TEXT_RETRY_ATTEMPTS = safePositiveInt(process.env.CHATGPT_TEXT_RETRY_ATTEMPTS, 4);
+const TEXT_STALL_RETRIES = safeNonNegativeInt(process.env.TEXT_STALL_RETRIES, 1);
+const PAGE_RECYCLE_AFTER_JOBS = safeNonNegativeInt(process.env.PAGE_RECYCLE_AFTER_JOBS, 50);
 // Hard browser-context reset is unsafe in CDP mode (we'd close the user's external Chrome).
 // Env override (`CHATGPT_TEXT_HARD_RESET=false`) disables it without a release.
 const TEXT_HARD_RESET_ENABLED =
@@ -94,6 +100,8 @@ const RENDER_WAIT_MS = safePositiveInt(process.env.RENDER_WAIT_SEC, 15) * 1000;
 // Snapshots may contain prompts and chat history — opt-in only
 const DEBUG_SNAPSHOTS_ENABLED = process.env.DEBUG_SNAPSHOTS === '1' || process.env.DEBUG_SNAPSHOTS === 'true';
 const DEBUG_SNAPSHOT_DIR = process.env.DEBUG_SNAPSHOT_DIR || '/tmp/chatgpt-debug';
+const STALL_SNAPSHOTS_ENABLED = process.env.STALL_SNAPSHOTS !== '0';
+const STALL_SNAPSHOT_KEEP = safePositiveInt(process.env.STALL_SNAPSHOT_KEEP, 20);
 // Stream-rescue (2026-07-11): новый рендерер ChatGPT может не дорисовать текст ответа
 // в headless-странице (submit подтверждён, сервер ответил — видно из другого клиента,
 // а в DOM пустой <p data-start data-end> внутри result-thinking). Если стрим не принёс
@@ -184,6 +192,8 @@ function createSlot(id) {
     recoveryState: 'healthy',
     pendingReset: null,
     menuFailures: 0,
+    backendResponses: [],
+    completedJobs: 0,
   };
 }
 
@@ -246,6 +256,7 @@ function beginBackendCapture(slot = getSlot(0)) {
   // First fresh (non-stale) stream observed after this point becomes THE stream of
   // this turn; chunks from any other stream id are ignored.
   slot.capture.boundStream = null;
+  slot.capture.startedAt = Date.now();
   return slot.capture;
 }
 
@@ -268,7 +279,7 @@ function conversationIdFromUrl(url) {
 // and finished SSE bodies (authoritative once the stream closed — merged into the live
 // capture in case the injected tee missed chunks).
 function onBackendResponse(slot, response) {
-  (async () => {
+  return (async () => {
     let pathname;
     try {
       pathname = new URL(response.url()).pathname;
@@ -277,9 +288,27 @@ function onBackendResponse(slot, response) {
     }
     if (!pathname.includes('/backend-api/')) return;
     const method = response.request().method();
+    const status = response.status ? response.status() : (response.ok() ? 200 : 0);
+    const ct = response.headers ? (response.headers()['content-type'] || '') : '';
+    const at = Date.now();
+    slot.backendResponses.push({ at, method, path: pathname.replace(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,}/gi, '<id>'), status, ct });
+    if (slot.backendResponses.length > 30) slot.backendResponses.shift();
+    // Snapshot before any await: a late body belongs to this turn, even if a
+    // different capture is active when the body eventually arrives.
+    const cap = activeCapture(slot);
     if (method === 'GET' && SINGLE_CONVERSATION_PATH_RE.test(pathname)) {
-      if (!response.ok()) return;
+      if (!response.ok()) {
+        if (cap) console.log(`[backend-read] slot=${slot.id} conversation GET status=${status}`);
+        return;
+      }
       const data = await response.json().catch(() => null);
+      if (cap) {
+        const nodes = Object.values(data?.mapping || {});
+        const last = data?.mapping?.[data.current_node]?.message
+          || nodes.filter(node => node.message).at(-1)?.message;
+        console.log(`[backend-read] slot=${slot.id} conversation GET status=${status} messages=${nodes.length} last_role=${last?.author?.role || 'none'} last_status=${last?.status || 'none'}`);
+      }
       const snap = data ? extractAssistantFromMapping(data) : null;
       if (snap && snap.lastAssistantText) {
         rememberConversation(slot, snap);
@@ -287,18 +316,52 @@ function onBackendResponse(slot, response) {
       return;
     }
     if (method === 'POST' && CONVERSATION_POST_PATH_RE.test(pathname)) {
-      const ct = response.headers()['content-type'] || '';
-      if (!ct.includes('text/event-stream')) return;
+      if (!cap) return;
+      cap.postStatus = { status, contentType: ct, at };
+      // Remember acceptance across multiple responses: a later failure must
+      // never erase evidence that the server could have begun generation.
+      if (status >= 200 && status < 300) cap.postAccepted = true;
+      if (status < 200 || status >= 300 || !ct.includes('text/event-stream')) {
+        const failure = { status, contentType: ct, snippet: '' };
+        cap.postFailure = failure;
+        let timer;
+        let body = null;
+        try {
+          body = await Promise.race([
+            response.text(),
+            new Promise(resolve => { timer = setTimeout(() => resolve(null), 5000); }),
+          ]);
+        } catch {} finally { clearTimeout(timer); }
+        if (body !== null) failure.snippet = String(body).replace(/\s+/g, ' ').trim().slice(0, 300);
+        console.log(`[backend-read] slot=${slot.id} conversation POST status=${status} ct=${ct} body=${body === null ? '<unread>' : JSON.stringify(failure.snippet)}`);
+        return;
+      }
       // Snapshot the capture BEFORE awaiting the body: the response event fires when
       // headers arrive (inside the right turn), but text() resolves only when the
       // stream ends — by then a NEW turn's capture may be current. Merging into the
       // snapshot keeps a late body from bleeding into the wrong turn (Codex P1).
-      const cap = activeCapture(slot);
-      if (!cap) return;
       const body = await response.text().catch(() => null);
       if (body) cap.merge(parseSseBody(body));
     }
   })().catch(() => {});
+}
+
+function throwBackendPostFailure(capture, onSubmitted = null) {
+  const failure = capture?.postFailure;
+  if (!failure || (failure.status >= 200 && failure.status < 300)) return;
+  // A refused POST still left the browser: do not classify it as a safe
+  // pre-submit retry when no user bubble appeared in the DOM.
+  if (onSubmitted) onSubmitted();
+  const err = new Error(`ChatGPT conversation POST ${failure.status}${failure.status === 429 ? ' rate limit' : ''}: ${failure.snippet}`);
+  err.code = failure.status === 429 ? 'rate_limit' : 'server_error';
+  if (failure.status === 429) err.modelMessage = failure.snippet;
+  throw err;
+}
+
+function logStallBackend(slot, capture) {
+  const entries = slot.backendResponses.filter(entry => entry.at >= capture?.startedAt);
+  const summary = entries.map(entry => `${entry.method} ${entry.path} ${entry.status}`).join(', ');
+  console.log(`[stall-diag] slot=${slot.id} backend-api since submit: ${summary || 'none'}`);
 }
 
 // Injected into every document at document_start: clones the SSE response of
@@ -1206,6 +1269,10 @@ async function maybeRecoverSession(slot = getSlot(0)) {
   if (!slot.pendingReset) return;
   const kind = slot.pendingReset;
   slot.pendingReset = null;
+  if (kind === 'recycle') {
+    resetPage(slot);
+    return;
+  }
   if (kind === 'hard') {
     console.log('[recovery] degradation during probation — hard browser reset');
     slot.recoveryState = 'probation';
@@ -1483,15 +1550,35 @@ async function removePendingAttachments(p) {
   }, ATTACHMENT_REMOVE_SEL).catch(() => {});
 }
 
+let snapshotSequence = 0;
+function pruneStallSnapshots() {
+  const pairs = new Map();
+  for (const name of fs.readdirSync(DEBUG_SNAPSHOT_DIR)) {
+    if (!/_text_(?:rescue|stalled)\.(?:png|html)$/.test(name)) continue;
+    const base = name.replace(/\.(?:png|html)$/, '');
+    const at = fs.statSync(`${DEBUG_SNAPSHOT_DIR}/${name}`).mtimeMs;
+    const pair = pairs.get(base) || { base, at, files: [] };
+    pair.at = Math.max(pair.at, at);
+    pair.files.push(name);
+    pairs.set(base, pair);
+  }
+  const oldest = [...pairs.values()].sort((a, b) => b.at - a.at || b.base.localeCompare(a.base)).slice(STALL_SNAPSHOT_KEEP);
+  for (const pair of oldest) {
+    for (const name of pair.files) fs.unlinkSync(`${DEBUG_SNAPSHOT_DIR}/${name}`);
+  }
+}
+
 async function saveDebugSnapshot(p, label) {
-  if (!DEBUG_SNAPSHOTS_ENABLED) return;
+  const stall = label === 'text_rescue' || label === 'text_stalled';
+  if (stall ? !STALL_SNAPSHOTS_ENABLED : !DEBUG_SNAPSHOTS_ENABLED) return;
   try {
     fs.mkdirSync(DEBUG_SNAPSHOT_DIR, { recursive: true });
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const base = `${DEBUG_SNAPSHOT_DIR}/${ts}_${label}`;
+    const ts = new Date(Date.now()).toISOString().replace(/[:.]/g, '-');
+    const base = `${DEBUG_SNAPSHOT_DIR}/${ts}_s${slotOf(p).id}_${++snapshotSequence}_${label}`;
     await p.screenshot({ path: `${base}.png`, fullPage: true }).catch(() => {});
     const html = await p.content().catch(() => '');
     if (html) fs.writeFileSync(`${base}.html`, html);
+    if (stall) pruneStallSnapshots();
     console.log(`[debug] Snapshot saved: ${base}.{png,html}`);
   } catch (e) {
     console.log('[debug] Snapshot failed:', e.message);
@@ -1608,6 +1695,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   };
 
   while (true) {
+    throwBackendPostFailure(capture);
     if (capture) {
       const snap = capture.snapshot();
       if (snap.lastAssistantText.length !== lastBackendLen) {
@@ -1733,6 +1821,8 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       } else {
         rescueAttempted = true;
         console.log(`[rescue] no rendered text for ${Math.round((Date.now() - lastProgressAt) / 1000)}s after submit — reloading page to fetch server-side result`);
+        logStallBackend(slotOf(p), capture);
+        await saveDebugSnapshot(p, 'text_rescue').catch(() => {});
         const reloaded = await p.reload({ waitUntil: 'domcontentloaded', timeout: 30000 })
           .then(() => true)
           .catch(e => { console.log('[rescue] reload failed:', e.message); return false; });
@@ -1752,9 +1842,16 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     // yet → the session is degraded; fail fast, release the queue, mark for page reset.
     if (!bestText && Date.now() - lastProgressAt >= stallWindowMs && Date.now() - start >= stallWindowMs) {
       markSessionDegraded(`text turn stalled: no page progress for ${Math.round((Date.now() - lastProgressAt) / 1000)}s`, slotOf(p));
+      logStallBackend(slotOf(p), capture);
       await saveDebugSnapshot(p, 'text_stalled').catch(() => {});
+      throwBackendPostFailure(capture);
       const err = new Error(`ChatGPT page showed no progress for ${Math.round(stallWindowMs / 1000)}s after submit`);
       err.code = 'timeout';
+      if (!bestText && capture && capture.boundStream === null && !capture.text
+          && !capture.postFailure && !capture.postAccepted
+          && (!capture.postStatus || capture.postStatus.status < 200 || capture.postStatus.status >= 300)) {
+        err.stallNoAnswer = true;
+      }
       throw err;
     }
 
@@ -2453,7 +2550,7 @@ async function typeLines(text, typeSegment, pressNewline) {
 // sent so a failure in the settle window is not retried into a duplicate submission.
 // timing (optional): gets `inputMs` — time spent putting the prompt into the composer — even
 // when the call throws, so a caller retrying the turn can count every attempt's input.
-async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted = null, timing = null) {
+async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted = null, timing = null, capture = null) {
   console.log('Typing prompt...');
   await dismissModals(p);
   const textareaLocator = p.locator(COMPOSER_VISIBLE_SEL);
@@ -2601,6 +2698,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   const submitDeadline = Date.now() + 12000;
   let submitted = false;
   while (Date.now() < submitDeadline) {
+    throwBackendPostFailure(capture, onSubmitted);
     const turnsNow = await countUserTurns();
     if (userTurnsBefore >= 0 && turnsNow > userTurnsBefore) { submitted = true; break; }
     const composerNow = normText(await readComposerText(textareaLocator.first()).catch(() => ''));
@@ -2612,6 +2710,7 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
     }
     await p.waitForTimeout(500).catch(() => {});
   }
+  throwBackendPostFailure(capture, onSubmitted);
   if (!submitted) {
     markSessionDegraded('prompt submit not confirmed in 12s', slotOf(p));
     await saveDebugSnapshot(p, 'submit_unconfirmed').catch(() => {});
@@ -3857,7 +3956,7 @@ async function checkSessionOnce({ force = false } = {}) {
     sessionHealth.recordSkip('queue_busy');
     return 'skipped';
   }
-  if (getSlot(0).pendingReset) {
+  if (getSlot(0).pendingReset && getSlot(0).pendingReset !== 'recycle') {
     // The page is already known-suspect and is about to be rebuilt by the next operation;
     // probing it would only risk another hung call (Codex review).
     sessionHealth.recordSkip('reset_pending');
@@ -4125,6 +4224,8 @@ async function completeText(prompt, options = {}) {
   // time keep the public success ratio close to UI reality. A second consecutive
   // page_load_failed escalates to a full browser-context rebuild (see catch block).
   const maxAttempts = CHATGPT_TEXT_RETRY_ATTEMPTS;
+  // Routes supply the same object on a pool restart, even on another slot.
+  const stallRetryState = options.stallRetryState || { used: 0 };
   let lastError;
   let pageLoadFailures = 0;
   // Streaming guard: once onDelta has fired, bytes of THIS attempt's answer are already
@@ -4148,7 +4249,7 @@ async function completeText(prompt, options = {}) {
       const p = await ensureLoggedIn(slot);
 
       if (options.conversationId) await openConversation(p, options.conversationId);
-      else if (!options.reuseChat || attempt > 0) await ensureNewChat(p);
+      else if (!options.reuseChat || attempt > 0 || stallRetryState.used > 0) await ensureNewChat(p);
       else await composerPreflight(p);
 
       const thinkingMode = normalizeThinkingMode(options.thinkingMode ?? options.thinking);
@@ -4174,7 +4275,7 @@ async function completeText(prompt, options = {}) {
       const timing = {};
       if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();
       try {
-        await typeAndSubmit(p, prompt, false, () => { submitted = true; }, timing);
+        await typeAndSubmit(p, prompt, false, () => { submitted = true; }, timing, capture);
       } finally {
         inputSpentMs += timing.inputMs || 0;
       }
@@ -4210,6 +4311,16 @@ async function completeText(prompt, options = {}) {
     } catch (err) {
       if (err && err.retryAfterMaintenance) throw err;
       lastError = err;
+      if (err.stallNoAnswer && !anyDeltaEmitted && !options.conversationId
+          && slot.pendingReset !== 'hard' && stallRetryState.used < TEXT_STALL_RETRIES) {
+        stallRetryState.used += 1;
+        if (typeof options.onAttemptFinished === 'function') options.onAttemptFinished();
+        console.log(`[chatgpt] stall with no answer after submit — fresh page, resending once (stall retry ${stallRetryState.used}/${TEXT_STALL_RETRIES})`);
+        // This resend has its own budget, including when normal attempts = 1.
+        // The next iteration consumes this slot's pending page reset.
+        attempt -= 1;
+        continue;
+      }
       const isPageLoad =
         err.code === 'page_load_failed' || /content failed to load/i.test(err.message || '');
       // Session died MID-turn: ChatGPT redirected to /auth/login while we were driving the
@@ -4283,6 +4394,19 @@ function discardSlotPage(slot) {
   victim.pagePromise = null;
   victim.capture = null;
   victim.lastConversationFetch = null;
+  victim.completedJobs = 0;
+}
+
+// Called once when a pool job settles, not when it yields to maintenance or
+// between stall attempts. Batch image requests are also one job.
+function recordSlotJobFinished(slotId) {
+  const slot = getSlot(slotId);
+  if (!slot.page) return;
+  slot.completedJobs += 1;
+  if (PAGE_RECYCLE_AFTER_JOBS > 0 && slot.completedJobs >= PAGE_RECYCLE_AFTER_JOBS && !slot.pendingReset) {
+    slot.pendingReset = 'recycle';
+    console.log(`[recycle] slot ${slot.id}: page served ${slot.completedJobs} jobs — fresh page on next job`);
+  }
 }
 
 function resetPage(slot = getSlot(0)) {
@@ -4324,6 +4448,7 @@ module.exports = {
   setPoolHooks,
   getPoolHooks,
   getSlot,
+  recordSlotJobFinished,
   probeCapabilities,
   normalizeThinkingMode,
   READ_VIA_BACKEND_API,
@@ -4337,6 +4462,9 @@ module.exports = {
   // regression shipped: it threw for every refusal, and `node --check` plus the whole suite
   // stayed green. A page double is enough — the throw happens long before any image work.
   _test: {
+    beginBackendCapture,
+    saveDebugSnapshot,
+    maybeRecoverSession,
     fillTimeoutMs,
     typeFallbackTimeoutMs,
     responseBaseBudgetMs,
