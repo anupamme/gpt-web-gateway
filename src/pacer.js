@@ -31,7 +31,6 @@
 // each of them. Found by codex.
 
 const DEFAULT_GAP_MS = 60 * 1000;
-const { abortable } = require('./request-lifecycle');
 
 // How often to beat while waiting. Far below any sane stuck threshold, and
 // coarse enough that a minute-long pause is a couple of timers, not a spin.
@@ -106,13 +105,12 @@ function createPacer({
     /** Holds until the configured gap since the previous upstream turn has
      *  passed, beating a heartbeat so the wait reads as progress. Returns how
      *  long it actually waited. */
-    async gate(signal) {
-      signal?.throwIfAborted();
+    async gate() {
       const total = waitFor();
       let pending = total;
       while (pending > 0) {
         const slice = Math.min(pending, heartbeatMs);
-        await abortable(sleep(slice), signal);
+        await sleep(slice);
         heartbeat();
         // Take the clock's answer when it shortens the wait (a forward NTP step
         // should end it early), but never let the remainder fail to shrink: a

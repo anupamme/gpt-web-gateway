@@ -58,18 +58,6 @@ ok('healthy failures (refused / rate_limit) reset the streak', () => {
   assert.strictEqual(p.liveness().alive, true); // streak restarted from refused
 });
 
-ok('caller cancellation preserves infra evidence without adding a failure', () => {
-  const p = createProgress(fakeClock());
-  p.jobStarted(); p.jobFinished('timeout');
-  p.jobStarted(); p.jobFinished('page_load_failed');
-  p.jobStarted(); p.jobCancelled();
-  assert.strictEqual(p.snapshot().queue_size, 0);
-  assert.strictEqual(p.snapshot().consecutive_infra_failures, 2);
-  assert.strictEqual(p.liveness().alive, true);
-  p.jobStarted(); p.jobFinished('timeout');
-  assert.strictEqual(p.liveness().alive, false);
-});
-
 ok('repeated partial-batch infra tails accumulate despite job successes', () => {
   const clock = fakeClock();
   const p = createProgress(clock);

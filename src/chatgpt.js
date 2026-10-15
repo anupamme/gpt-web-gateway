@@ -1,5 +1,4 @@
 const { getContext, saveSession, closeBrowser, browserFingerprint, maybeHideWebdriverOnPage } = require('./browser');
-const { abortable, withCancellationCleanup } = require('./request-lifecycle');
 const { autoLogin } = require('./auto-login');
 const {
   sessionHealth, createLoginThrottle, recordLoginFailure, decideSessionAction, shouldRebuildContext,
@@ -81,8 +80,6 @@ const CHAT_COMPLETION_RETRY_TIMEOUT_MS = safePositiveInt(process.env.CHAT_COMPLE
 // (incident 2026-07-10: a trivial prompt hung 499s and head-of-line-blocked the queue) —
 // stop-button alone is not proof of live generation.
 const CHAT_STALL_WINDOW_MS = safePositiveInt(process.env.CHAT_STALL_WINDOW_SEC, 120) * 1000;
-// One DOM read must not suspend the Node-side completion/stall guards indefinitely.
-const TEXT_PAGE_POLL_TIMEOUT_MS = safePositiveInt(process.env.TEXT_PAGE_POLL_TIMEOUT_MS, 10000);
 // Text-turn retry budget. A repeated page_load_failed signals a poisoned service-worker
 // app-shell cache that survives in the browser context, so a fresh page alone won't help —
 // the catch block escalates to a full context rebuild (see TEXT_HARD_RESET_ENABLED).
@@ -1475,38 +1472,6 @@ async function captureTextState(p) {
   });
 }
 
-async function readTextPage(p, promise, signal) {
-  try {
-    const result = await raceDeadline(abortable(promise, signal), TEXT_PAGE_POLL_TIMEOUT_MS);
-    if (result === PROBE_DEADLINE) {
-      const err = new Error('ChatGPT renderer did not answer a text page read before its deadline');
-      err.code = 'page_load_failed';
-      throw err;
-    }
-    return result;
-  } catch (err) {
-    await closeOwnedTextPage(p);
-    throw err;
-  }
-}
-
-const closingTextPages = new WeakMap();
-function closeOwnedTextPage(p) {
-  if (!p) return Promise.resolve();
-  if (closingTextPages.has(p)) return closingTextPages.get(p);
-  if (p === page) page = null;
-  const closing = Promise.resolve().then(() => p.close()).catch(async () => {
-    if (p.isClosed()) return;
-    // Releasing ownership after an unsuccessful close would interleave old page
-    // work with a new request. Keep the slot; the existing stuck liveness guard
-    // is the final recovery if even the browser cannot close its own page.
-    console.error('[chatgpt] text page close failed; retaining browser ownership for liveness recovery');
-    await new Promise(() => {});
-  });
-  closingTextPages.set(p, closing);
-  return closing;
-}
-
 // Placeholder text ChatGPT shows in the assistant message bubble WHILE reasoning
 // is still in progress (the collapsible "Thinking" block before the actual answer
 // is streamed in). If the extractor grabs this and returns early, the caller sees
@@ -1563,7 +1528,6 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   };
 
   while (true) {
-    options.signal?.throwIfAborted();
     if (capture) {
       const snap = capture.snapshot();
       if (snap.lastAssistantText.length !== lastBackendLen) {
@@ -1589,7 +1553,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       }
     }
 
-    const state = await readTextPage(p, captureTextState(p).catch(() => null), options.signal);
+    const state = await captureTextState(p).catch(() => null);
     if (state) {
       // Successful page poll = the browser event loop is alive — feed /health/live so a
       // long legitimate wait is never mistaken for a wedged process.
@@ -1661,7 +1625,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
         if (!capture) emitDelta(bestText);
       }
 
-      const stopBtn = await readTextPage(p, p.$(STOP_BTN_SELECTOR).catch(() => null), options.signal);
+      const stopBtn = await p.$(STOP_BTN_SELECTOR).catch(() => null);
       if (bestText && !stopBtn && stableSince && Date.now() - stableSince >= stableMs) {
         return { text: bestText, conversationId: conversationIdFromUrl(p.url()) };
       }
@@ -1677,7 +1641,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     if (!bestText && !rescueAttempted
         && Date.now() - lastProgressAt >= CHAT_STREAM_RESCUE_MS
         && Date.now() - start >= CHAT_STREAM_RESCUE_MS) {
-      const generating = await readTextPage(p, p.$(STOP_BTN_SELECTOR).catch(() => null), options.signal);
+      const generating = await p.$(STOP_BTN_SELECTOR).catch(() => null);
       if (generating) {
         // Живая генерация без прогресса текста — оставляем это stall-guard'у.
       } else if (!/\/c\//.test(p.url())) {
@@ -1718,7 +1682,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       // (captureTextState may have returned null). If ChatGPT is still streaming/
       // thinking, grant one extra window instead of cutting an in-progress answer.
       if (!extended) {
-        const stillGenerating = await readTextPage(p, p.$(STOP_BTN_SELECTOR).catch(() => null), options.signal);
+        const stillGenerating = await p.$(STOP_BTN_SELECTOR).catch(() => null);
         const progressedRecently = Date.now() - lastProgressAt < stallWindowMs;
         if (stillGenerating && progressedRecently) {
           extended = true;
@@ -3974,12 +3938,6 @@ async function editImage(prompt, imageInput, options = {}) {
 }
 
 async function completeText(prompt, options = {}) {
-  return withCancellationCleanup(
-    () => completeTextRun(prompt, options), options.signal, () => closeOwnedTextPage(page),
-  );
-}
-
-async function completeTextRun(prompt, options) {
   // Page-load failures on chatgpt.com tend to come in bursts (CF challenge,
   // empty SPA boot, transient 5xx from OpenAI). One in-process retry leaves a
   // visible failure rate on the caller; multiple attempts with a fresh page each
@@ -3998,7 +3956,6 @@ async function completeTextRun(prompt, options) {
   // Input time across ALL attempts — a retried turn already spent it once.
   let inputSpentMs = 0;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    options.signal?.throwIfAborted();
     // Becomes true once THIS attempt has actually sent the prompt. A logout/navigation error
     // AFTER submit must not retry — a fresh chat would re-send the same prompt (duplicate
     // generation / side effects). Before submit, retrying is safe.
@@ -4007,20 +3964,16 @@ async function completeTextRun(prompt, options) {
       // Prep is INSIDE the try — ensureNewChat/setThinkingMode can also die on a broken
       // page, and those failures must ride the same retry/hard-reset machinery.
       await maybeRecoverSession();
-      options.signal?.throwIfAborted();
       const p = await ensureLoggedIn();
-      if (options.signal?.aborted) { await closeOwnedTextPage(p); options.signal.throwIfAborted(); }
 
       if (options.conversationId) await openConversation(p, options.conversationId);
       else if (!options.reuseChat || attempt > 0) await ensureNewChat(p);
       else await composerPreflight(p);
-      options.signal?.throwIfAborted();
 
       const thinkingMode = normalizeThinkingMode(options.thinkingMode ?? options.thinking);
       const thinkingState = await setThinkingMode(p, thinkingMode);
-      options.signal?.throwIfAborted();
 
-      const beforeState = await readTextPage(p, captureTextState(p), options.signal);
+      const beforeState = await captureTextState(p);
       // Prime BEFORE opening the capture, and the order is load-bearing twice over.
       //
       // (a) `page.on('load')` covers real document navigations, but ChatGPT is an SPA and a
@@ -4032,8 +3985,7 @@ async function completeTextRun(prompt, options) {
       //     then be ignored as belonging to a different stream (Codex). Draining first lets
       //     them land while `currentCapture` is still null, which is exactly what marks them
       //     stale.
-      await readTextPage(p, primeMainWorld(p), options.signal);
-      options.signal?.throwIfAborted();
+      await primeMainWorld(p);
       const capture = beginBackendCapture(); // null unless READ_VIA_BACKEND_API=1
       // Mark submitted at the confirmed-send instant (inside typeAndSubmit), not just on
       // return — a failure in its trailing settle wait must still count as submitted so we
@@ -4053,7 +4005,6 @@ async function completeTextRun(prompt, options) {
         onDelta,
         prompt,      // subtracted from the tier-limit scan: it is rendered on the page too
         inputMs: inputSpentMs, // every attempt's input, not just this one's
-        signal: options.signal,
       });
 
       if (thinkingState.verified) markHealthyCompletion();
@@ -4075,7 +4026,6 @@ async function completeTextRun(prompt, options) {
         },
       };
     } catch (err) {
-      options.signal?.throwIfAborted();
       lastError = err;
       const isPageLoad =
         err.code === 'page_load_failed' || /content failed to load/i.test(err.message || '');

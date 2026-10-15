@@ -32,9 +32,8 @@ diff -r --exclude=.env --exclude=README.md \
 repo's `.gitignore`. Only `.env.example` is tracked. The sync commands above exclude it in
 both directions, so a copy can never overwrite or publish the real one.
 
-This repository is public. Keep service hosts, infrastructure identifiers and
-credentials out of every tracked file; live skill docs may contain private
-values and must be sanitized before syncing back.
+Note the repository is private, so the service hostname in the docs stays internal. If it is
+ever opened up, sanitize `SKILL.md` and `rules.md` first.
 
 ## Keeping the two in step
 
@@ -43,9 +42,3 @@ the one inside it (see the comment on the ingress annotation in `helm/templates/
 A `--max-time` here that is lower than the server budget silently turns a working slow request
 into a client-side abort — which is exactly the bug `generate.sh` carried at 600 s while the
 server was allowed 690 s for an image.
-
-For bounded text jobs, set `CHATGPT_WEB_TIMEOUT_SECONDS` (default `1020`).
-`chat.sh` sends both curl's timeout and `X-Request-Timeout-Ms`; the server includes
-queue wait and cancels expired work. `--json` retains structured API errors on
-non-2xx responses. Exit 4 means explicit `login_failed`; other HTTP 503 kinds
-remain transient failures with exit 1.

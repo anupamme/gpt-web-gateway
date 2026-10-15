@@ -34,9 +34,6 @@ function createProgress(now = Date.now) {
     // Any observable liveness: job start/finish, successful page poll, per-image turn.
     touch() { state.lastProgressAt = now(); },
     jobStarted() { state.queueSize++; state.lastProgressAt = now(); },
-    // A caller leaving says nothing about browser health. Preserve the failure
-    // streak instead of treating a cancellation as either failure or success.
-    jobCancelled() { state.queueSize = Math.max(0, state.queueSize - 1); state.lastProgressAt = now(); },
     jobFinished(errorKind = null) {
       state.queueSize = Math.max(0, state.queueSize - 1);
       state.lastProgressAt = now();
