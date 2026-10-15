@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.15.0 — 2026-10-15
+
+- Up to `MAX_CONCURRENT_JOBS` jobs (1..5, default 3) now run at once, each on
+  its own browser tab in one context; further jobs wait in FIFO order.
+  `MAX_QUEUE_SIZE` now limits only the waiting jobs.
+- Answer capture, page resets and recovery state are kept per tab, so a reply
+  or `conversation_id` from one tab never reaches another job. Requests that
+  continue the same `conversation_id` never run in two tabs at once.
+- Browser-wide work (hard reset, context rebuild, auto-login, manual `/login`,
+  startup warm-up, session watchdog) runs only while no job holds a tab. A job
+  that needs it before sending its prompt returns to the head of the queue.
+- Pacing moves to the moment of sending: `MIN_JOB_GAP_SEC` is now per tab, a
+  new `MIN_TURN_STAGGER_SEC` (default 10) spaces the starts of different tabs,
+  and the rate-limit cooldown still stops every tab.
+- Liveness tracks each running job, so a wedged tab is visible while the
+  others make progress.
+- `/v1/images/status` reports `running`, `waiting`, `concurrency` and slots.
+- The chart sets `MAX_CONCURRENT_JOBS: "3"` and raises limits to 2 CPU / 4Gi.
+
 ## 2.14.10 — 2026-10-13
 
 - `proxy-addr` 2.0.7 → 2.0.8 in the lockfile (express 4 allows `~2.0.7`),

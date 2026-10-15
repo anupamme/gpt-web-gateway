@@ -8,7 +8,7 @@
 
 ## Где работать
 
-Клон `/home/deploy/exec-clones/parallel-pool`, новая ветка `feat/parallel-pool`. Живое дерево
+Клон `<clone-root>/parallel-pool`, новая ветка `feat/parallel-pool`. Живое дерево
 `~/github/gpt-web-gateway` не трогать. **`git push` в origin запрещён** — работу заберёт
 постановщик через `git fetch` из клона. Всё запускать в Docker `node:24` под `-u 1002:1002`.
 Постановщик уже положил `node_modules` (`npm ci --ignore-scripts`, untracked, в .gitignore).

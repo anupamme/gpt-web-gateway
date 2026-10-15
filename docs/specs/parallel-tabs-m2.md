@@ -8,7 +8,7 @@
 
 ## Где работать
 
-Клон `/home/deploy/exec-clones/parallel-tabs`, новая ветка `feat/parallel-tabs`. Живое дерево не трогать.
+Клон `<clone-root>/parallel-tabs`, новая ветка `feat/parallel-tabs`. Живое дерево не трогать.
 **`git push` в origin запрещён** — работу заберёт постановщик через `git fetch`. Всё — в
 Docker `node:24` под `-u 1002:1002`. `node_modules` положен постановщиком (untracked).
 Браузер и ChatGPT в этой вехе НЕ запускаются: живую проверку делает постановщик на проде.

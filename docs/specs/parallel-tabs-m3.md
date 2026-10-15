@@ -9,7 +9,7 @@
 
 ## Где работать
 
-Клон `/home/deploy/exec-clones/parallel-tabs-fix`, новая ветка `fix/parallel-tabs`. Живое
+Клон `<clone-root>/parallel-tabs-fix`, новая ветка `fix/parallel-tabs`. Живое
 дерево не трогать. **`git push` в origin запрещён** — работу заберёт постановщик через
 `git fetch`. Всё — в Docker `node:24` под `-u 1002:1002`. `node_modules` положен
 постановщиком (untracked). Браузер и ChatGPT не запускаются.
