@@ -227,6 +227,22 @@ test('429 during submit confirmation is rate_limit with no pre-submit retry', as
   });
 });
 
+// M21: the rejection snippet looks transient, but the POST already left the browser.
+test('a rejected POST with transient-looking body never resubmits an unconfirmed turn', async () => {
+  await fixture({ CHATGPT_TEXT_RETRY_ATTEMPTS: '4' }, async ({ chat, page, queue, pages }) => {
+    const p = page({ unconfirmed: true, onSend: async p => {
+      p.emit('response', response({ status: 503, ct: 'application/json',
+        text: async () => 'content failed to load' }));
+      await flush();
+    } });
+    queue.push(p);
+    await assert.rejects(chat.completeText('hello', { thinkingMode: 'instant' }), e =>
+      e.code === 'server_error' && /503.*content failed to load/.test(e.message));
+    assert.equal(pages.length, 1, 'a refused POST must not enter the pre-submit retry path');
+    assert.equal(p.sends, 1);
+  });
+});
+
 test('backend ring is per slot, bounded, redacts ids and includes pre-wait responses at rescue and abort', async () => {
   await fixture({}, async ({ chat, page, queue, clock }) => {
     const p = page(); p.address += `c/${CONVERSATION}`; queue.push(p);
@@ -270,6 +286,27 @@ test('GET diagnostics include mapping size and current message metadata, with st
     assert.match(output, /slot=1 conversation GET status=200 messages=2 last_role=assistant last_status=finished_successfully/);
     assert.match(output, /slot=1 conversation GET status=403\n/);
     assert.equal(slot.lastConversationFetch.lastAssistantText, 'answer');
+  });
+});
+
+// M45: with no current_node, the first and last message have different metadata.
+test('GET diagnostics fall back to the last message when current_node is absent', async () => {
+  await fixture({}, async ({ chat, page, queue }) => {
+    const p = page(); queue.push(p);
+    const slot = chat.getSlot(0); await chat.getPage(slot);
+    chat._test.beginBackendCapture(slot);
+    const data = { conversation_id: CONVERSATION, mapping: {
+      root: { message: null },
+      first: { message: { author: { role: 'user' }, status: 'sent',
+        content: { content_type: 'text', parts: ['question'] } } },
+      last: { message: { author: { role: 'assistant' }, status: 'finished_successfully',
+        content: { content_type: 'text', parts: ['answer'] } } },
+    } };
+    const { output } = await logs(async () => {
+      p.emit('response', response({ method: 'GET', url: `/backend-api/conversation/${CONVERSATION}`, data }));
+      await flush();
+    });
+    assert.match(output, /messages=3 last_role=assistant last_status=finished_successfully/);
   });
 });
 
@@ -321,6 +358,55 @@ test('rescue snapshot precedes reload and abort snapshot is written with debug o
       }
     });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// M49: timestamp, slot and label all collide; both saved pairs must survive.
+test('same-millisecond snapshots with the same slot and label keep distinct pairs', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stall-collision-'));
+  try {
+    await fixture({ STALL_SNAPSHOTS: '1', DEBUG_SNAPSHOT_DIR: dir }, async ({ chat, page }) => {
+      const p = page();
+      for (const value of ['first', 'second']) {
+        p.screenshot = async () => Buffer.from(value);
+        p.content = async () => `<html>${value}</html>`;
+        await chat._test.saveDebugSnapshot(p, 'text_stalled');
+      }
+      const files = fs.readdirSync(dir);
+      assert.equal(files.length, 4, 'same-millisecond snapshots must not overwrite each other');
+      const pngs = files.filter(f => f.endsWith('.png'));
+      assert.equal(pngs.length, 2);
+      assert.deepEqual(pngs.map(f => fs.readFileSync(path.join(dir, f), 'utf8')).sort(), ['first', 'second']);
+      for (const png of pngs) {
+        const value = fs.readFileSync(path.join(dir, png), 'utf8');
+        assert.equal(fs.readFileSync(path.join(dir, png.replace(/\.png$/, '.html')), 'utf8'), `<html>${value}</html>`);
+      }
+    });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// M41: a new page may restore a conversation route during boot.
+test('a stall resend starts a new chat even when reuseChat was requested', async () => {
+  await fixture({}, async ({ chat, page, queue, pages }) => {
+    const stalled = page();
+    const sentUrls = [];
+    const fresh = page({ answer: true, onSend: p => { sentUrls.push(p.url()); } });
+    const goto = fresh.goto.bind(fresh);
+    let navigations = 0;
+    fresh.goto = async (...args) => {
+      const result = await goto(...args);
+      if (++navigations === 1) fresh.address = `https://chatgpt.com/c/${CONVERSATION}`;
+      return result;
+    };
+    queue.push(stalled, fresh);
+    const state = { used: 0 };
+    const result = await chat.completeText('hello', { thinkingMode: 'instant', reuseChat: true, stallRetryState: state });
+    assert.equal(result.text, 'answer');
+    assert.equal(state.used, 1);
+    assert.equal(pages.length, 2);
+    assert.equal(stalled.sends, 1);
+    assert.equal(fresh.sends, 1);
+    assert.deepEqual(sentUrls, ['https://chatgpt.com'], 'resend must leave a restored conversation first');
+  });
 });
 
 test('stall retries once on a fresh page even with one normal attempt and leaves neighbour untouched', async () => {
@@ -408,6 +494,36 @@ test('second stall on probation escalates without a third send', async () => {
     await assert.rejects(chat.completeText('hello', { thinkingMode: 'instant' }), e => e.code === 'timeout');
     assert.equal(pages.length, 2);
     assert.equal(chat.getSlot(0).pendingReset, 'hard');
+  });
+});
+
+// M03: without onDelta, partial backend text is the independent resend guard.
+test('backend partial text without a delta callback forbids a resend', async () => {
+  await fixture({}, async ({ chat, page, queue, pages }) => {
+    const p = page({ onSend: () => { chat.getSlot(0).capture.text = 'partial'; } });
+    queue.push(p);
+    await assert.rejects(chat.completeText('hello', { thinkingMode: 'instant' }), e =>
+      e.code === 'timeout' && !e.stallNoAnswer);
+    assert.equal(p.sends, 1);
+    assert.equal(pages.length, 1);
+  });
+});
+
+// M51: Number('   ') is zero; whitespace-only env values must use defaults.
+test('whitespace-only numeric settings use their defaults', async () => {
+  await fixture({ TEXT_STALL_RETRIES: ' \t ', PAGE_RECYCLE_AFTER_JOBS: ' \t ' }, async ({ chat, page, queue }) => {
+    queue.push(page(), page({ answer: true }));
+    const state = { used: 0 };
+    let result;
+    await assert.doesNotReject(async () => {
+      result = await chat.completeText('hello', { thinkingMode: 'instant', stallRetryState: state });
+    }, 'blank TEXT_STALL_RETRIES must retain the default one resend');
+    assert.equal(result.text, 'answer');
+    assert.equal(state.used, 1);
+    for (let i = 0; i < 49; i++) chat.recordSlotJobFinished(0);
+    assert.equal(chat.getSlot(0).pendingReset, null);
+    chat.recordSlotJobFinished(0);
+    assert.equal(chat.getSlot(0).pendingReset, 'recycle', 'blank recycle threshold must retain the default fifty jobs');
   });
 });
 

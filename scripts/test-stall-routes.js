@@ -52,6 +52,37 @@ function request(port, method, url, body) {
 }
 
 for (const stream of [false, true]) {
+  // M15: maintenance need not discard pages (which would hide an extra count).
+  test(`${stream ? 'streaming' : 'JSON'} requeue without discarding pages counts only the completed job`, async () => {
+    await fixture({}, async f => {
+      const p = f.page({ answer: true }); f.queue.push(p);
+      const complete = f.chat.completeText;
+      let calls = 0;
+      let countDuringMaintenance;
+      f.chat.completeText = (prompt, options) => complete(prompt, { ...options,
+        beforeSubmit: async () => {
+          if (++calls === 1) {
+            f.chat.getPoolHooks().requestMaintenance('keep-pages', async () => {
+              countDuringMaintenance = f.chat.getSlot(options.job.slotId).completedJobs;
+            });
+            throw Object.assign(new Error('maintenance before submit'), { retryAfterMaintenance: true });
+          }
+          await options.beforeSubmit();
+        },
+      });
+      await withRouter(f, async ({ port }) => {
+        const result = await request(port, 'POST', '/v1/chat/completions', { input: 'hello', thinking_mode: 'instant', stream });
+        assert.equal(result.status, 200, result.text);
+        assert.match(result.text, /answer/);
+        assert.equal(countDuringMaintenance, 0, 'requeued attempt is not a completed job');
+        assert.equal(f.chat.getSlot(0).completedJobs, 1);
+        assert.equal(f.pages.length, 1, 'maintenance keeps the page so counts cannot be masked by reset');
+        assert.equal(p.sends, 1);
+        assert.equal(calls, 2);
+      });
+    });
+  });
+
   test(`real ${stream ? 'streaming' : 'JSON'} job paces a stall resend from the previous finish exactly once per attempt`, async () => {
     await fixture({ PAGE_RECYCLE_AFTER_JOBS: '1' }, async f => {
       const stalled = f.page(); const fresh = f.page({ answer: true }); f.queue.push(stalled, fresh);
@@ -145,6 +176,31 @@ test('job log context survives awaits and isolates concurrent slots; outside log
       assert.ok(!/\[s\d\] \[s\d\]/.test(output), 'wrapper installed multiple times');
     } finally { process.stderr.write = originalErr; }
   });
+});
+
+// M50: re-evaluation used to throw Cannot redefine property before wrapping console.
+test('reloading log context inside a job preserves the shared installation', async () => {
+  const id = require.resolve('../src/log-context');
+  const first = require(id);
+  const cached = require.cache[id];
+  try {
+    const { output } = await logs(() => first.runWithLogContext({ slotId: 7 }, async () => {
+      console.log('before reload');
+      delete require.cache[id];
+      let reloaded;
+      assert.doesNotThrow(() => { reloaded = require(id); }, 're-evaluation must reuse the nonconfigurable console property');
+      await flush();
+      console.log('after reload');
+      await reloaded.runWithLogContext({ slotId: 8 }, async () => {
+        await flush();
+        console.log('nested job');
+      });
+      console.log('outer job');
+    }));
+    // The TAP reporter can flush its own header during the awaited job.
+    const jobLines = output.split('\n').filter(line => /^\[s\d+\] /.test(line));
+    assert.deepEqual(jobLines, ['[s7] before reload', '[s7] after reload', '[s8] nested job', '[s7] outer job']);
+  } finally { require.cache[id] = cached; }
 });
 
 test('access logger skips only GET root, including query string, and keeps other requests', async () => {

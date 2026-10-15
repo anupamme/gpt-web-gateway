@@ -57,6 +57,29 @@ test('D1: acceptance arriving at the submit deadline still calls onSubmitted', a
     await chat._test.typeAndSubmit(p, 'hello', false, () => submitted++, null, cap);
     assert.equal(submitted, 1);
     assert.equal(p.sends, 1);
+    assert.equal(slot.pendingReset, null, 'deadline acceptance must avoid false session degradation');
+    assert.equal(slot.recoveryState, 'healthy');
+  });
+});
+
+test('D1: accepted POST exits confirmation polling immediately', async () => {
+  await fixture({}, async ({ chat, page, queue }) => {
+    const p = page({ unconfirmed: true, onSend: p => p.emit('response', response()) });
+    queue.push(p);
+    const slot = chat.getSlot(0); await chat.getPage(slot);
+    const cap = chat._test.beginBackendCapture(slot);
+    const wait = p.waitForTimeout.bind(p);
+    let polls = 0;
+    p.waitForTimeout = async ms => {
+      if (p.sends && ms === 500) polls++;
+      await wait(ms);
+    };
+    let submitted = 0;
+    await chat._test.typeAndSubmit(p, 'hello', false, () => submitted++, null, cap);
+    assert.equal(polls, 0, 'a confirmed backend POST must not wait out the DOM confirmation window');
+    assert.equal(submitted, 1);
+    assert.equal(p.sends, 1);
+    assert.equal(slot.pendingReset, null);
   });
 });
 
@@ -172,6 +195,26 @@ test('D3: replacing the page while GET/SSE bodies are pending ignores their late
     assert.equal(next.text, '');
     assert.equal(slot.lastConversationFetch, null);
     assert.doesNotMatch(output, /conversation GET/);
+  });
+});
+
+test('D3: non-SSE POST body completing after page replacement stays silent', async () => {
+  await fixture({}, async ({ chat, page, queue }) => {
+    const old = page(); queue.push(old);
+    const slot = chat.getSlot(0); await chat.getPage(slot);
+    const cap = chat._test.beginBackendCapture(slot);
+    const body = deferred();
+    old.emit('response', response({ status: 503, ct: 'application/json', text: () => body.promise }));
+    assert.equal(cap.postFailure.status, 503);
+    chat.resetPage(slot);
+    const current = page(); queue.push(current); await chat.getPage(slot);
+    const next = chat._test.beginBackendCapture(slot);
+    const { output } = await logs(async () => {
+      body.resolve('old failure'); await flush();
+    });
+    assert.doesNotMatch(output, /conversation POST/, 'stale response bodies must not emit current diagnostics');
+    assert.equal(cap.postFailure.snippet, '');
+    assert.equal(next.postFailure, undefined);
   });
 });
 
