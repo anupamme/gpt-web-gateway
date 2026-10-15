@@ -9,7 +9,8 @@ let loginPage = null;
 
 // One manual-login capture for every /login/* caller. Parallel requests wait
 // on the same acquireExclusive promise and share its release. /login/save and
-// ten minutes without a /login/* call drop it. The timer re-arms on each call.
+// ten minutes without an active /login/* call drop it. Pending acquisitions
+// have no idle deadline; screenshots only extend an existing capture.
 const LOGIN_IDLE_MS = 10 * 60 * 1000;
 let loginHold = null;
 
@@ -37,36 +38,53 @@ function armLoginIdle() {
   if (typeof loginHold.timer.unref === 'function') loginHold.timer.unref();
 }
 
-async function enterManualLogin() {
+function loginError(message, status = 503) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
+async function enterManualLogin({ acquire = true } = {}) {
   progress.touch();
   if (loginHold) {
+    const attempt = loginHold;
+    try {
+      await attempt.acquired;
+    } catch (err) {
+      throw loginError(err.message);
+    }
+    if (loginHold !== attempt || typeof attempt.release !== 'function') {
+      throw loginError('login session ended while waiting for the exclusive');
+    }
     armLoginIdle();
-    await loginHold.acquired;
     return;
   }
-  const hooks = getPoolHooks();
-  if (!hooks || typeof hooks.acquireExclusive !== 'function') {
-    const err = new Error('pool hooks not set');
-    err.code = 'server_error';
-    throw err;
+  if (!acquire) {
+    throw loginError('login session is not active — open /login', 409);
   }
-  const acquired = hooks.acquireExclusive('manual-login');
-  const attempt = { acquired, release: null, timer: null };
-  loginHold = attempt;
-  armLoginIdle();
+  let attempt;
   try {
+    const hooks = getPoolHooks();
+    if (!hooks || typeof hooks.acquireExclusive !== 'function') {
+      throw new Error('pool hooks not set');
+    }
+    const acquired = hooks.acquireExclusive('manual-login');
+    attempt = { acquired, release: null, timer: null };
+    loginHold = attempt;
     const release = await acquired;
     if (loginHold !== attempt) {
       if (typeof release === 'function') release();
-      return;
+      throw new Error('login session ended while waiting for the exclusive');
     }
+    if (typeof release !== 'function') throw new Error('login exclusive was not acquired');
     attempt.release = release;
+    armLoginIdle();
   } catch (err) {
-    if (loginHold === attempt) {
+    if (attempt && loginHold === attempt) {
       if (attempt.timer) clearTimeout(attempt.timer);
       loginHold = null;
     }
-    throw err;
+    throw loginError(err.message);
   }
 }
 
@@ -84,7 +102,7 @@ router.get('/login', async (req, res) => {
   try {
     await enterManualLogin();
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(err.status || 500).json({ error: err.message });
   }
   res.send(`<!DOCTYPE html>
 <html><head>
@@ -184,14 +202,14 @@ router.get('/login', async (req, res) => {
 // Screenshot
 router.get('/login/screenshot', async (req, res) => {
   try {
-    await enterManualLogin();
+    await enterManualLogin({ acquire: false });
     const p = await getLoginPage();
     const buffer = await p.screenshot({ type: 'jpeg', quality: 80 });
     res.set('Content-Type', 'image/jpeg');
     res.set('Cache-Control', 'no-cache');
     res.send(buffer);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -204,7 +222,7 @@ router.post('/login/click', async (req, res) => {
     await p.mouse.click(x, y);
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -217,7 +235,7 @@ router.post('/login/type', async (req, res) => {
     await p.keyboard.type(text, { delay: 30 });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -230,7 +248,7 @@ router.post('/login/key', async (req, res) => {
     await p.keyboard.press(key);
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -249,7 +267,7 @@ router.post('/login/navigate', async (req, res) => {
     await p.goto(LOGIN_NAV_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     res.json({ ok: true, url: LOGIN_NAV_URL });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -281,7 +299,7 @@ router.post('/login/save', async (req, res) => {
     await run;
     res.json({ message: 'Session saved! Main page reset. You can now use the API.' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 

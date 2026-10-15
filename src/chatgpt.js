@@ -3601,14 +3601,19 @@ async function _ensureLoggedIn(slot, opts) {
   // before touching the page (Codex review). Capped: a request must never be able to hang
   // on a background timer.
   if (sessionProbeInFlight) {
-    const lease = await raceDeadline(sessionProbeInFlight.catch(() => {}), SESSION_LEASE_WAIT_MS);
+    const watchedProbe = sessionProbeInFlight;
+    const watchedPage = sessionProbePage;
+    const lease = await raceDeadline(watchedProbe.catch(() => {}), SESSION_LEASE_WAIT_MS);
     if (lease === PROBE_DEADLINE) {
       // The watchdog is still holding a page that will not answer. Don't start working on
       // it — discard it (which also unblocks the watchdog's own pending call) and rebuild.
       console.log('[chatgpt] watchdog probe did not release the page within the lease budget — discarding it');
-      markSessionDegraded('session probe lease timeout', slot);
-      closeWedgedPage(slot.page);
-      sessionProbeInFlight = null;
+      if (sessionProbeInFlight === watchedProbe) {
+        markSessionDegraded('session probe lease timeout', slotOf(watchedPage));
+        closeWedgedPage(watchedPage);
+        sessionProbeInFlight = null;
+        sessionProbePage = null;
+      }
     }
   }
 
@@ -3779,6 +3784,7 @@ async function autoLoginMaintenance(slot, state) {
   // From here on the old session is being destroyed (autoLogin → clearSession), so the
   // gauge must drop immediately and without hysteresis.
   sessionHealth.invalidate(`relogin:${state}`);
+  let recordedLoginError = null;
   try {
     resetPage(slot);
     const ctx = await getContext();
@@ -3794,6 +3800,8 @@ async function autoLoginMaintenance(slot, state) {
       recordLoginFailure('unknown');
       loginThrottle.recordFailure(e);
       sessionHealth.invalidate(`post_login:${after}`);
+      e.loginRecorded = true;
+      recordedLoginError = e;
       throw e;
     }
     sessionHealth.recordProbe(after, 'post_login');
@@ -3801,8 +3809,7 @@ async function autoLoginMaintenance(slot, state) {
     await maybeDisableMemory(fresh);
     return fresh;
   } catch (e) {
-    if (e && e.code === 'login_failed' && e.loginBlocker) throw e;
-    if (e && e.code === 'login_failed' && /not authenticated|cooldown|CHATGPT_EMAIL/.test(e.message || '')) throw e;
+    if (e && e === recordedLoginError && e.loginRecorded) throw e;
     const err = new Error(`auto-login failed: ${e.message}`);
     err.code = 'login_failed';
     err.loginBlocker = e.loginBlocker || 'unknown';
@@ -3831,11 +3838,12 @@ async function autoLoginMaintenance(slot, state) {
 //   - never triggers auto-login itself. It only reports; recovery stays on the request
 //     path (and on the owner, for a session that needs a manual /login).
 //
-// The queue check alone is a TOCTOU (a request can enqueue right after it), so an
-// in-flight probe is published as `sessionProbeInFlight` and _ensureLoggedIn awaits it —
-// the two never drive the page concurrently (Codex review).
+// Acquire the pool exclusive synchronously after the idle check, before probing.
+// Publish the pending acquisition and probe as one lease; legacy callers of
+// _ensureLoggedIn also wait on it and discard only its page if the lease expires.
 let watchdogTimer = null;
 let sessionProbeInFlight = null;
+let sessionProbePage = null;
 
 async function checkSessionOnce({ force = false } = {}) {
   if (sessionProbeInFlight) {
@@ -3843,7 +3851,9 @@ async function checkSessionOnce({ force = false } = {}) {
     sessionHealth.recordSkip('probe_in_flight');
     return 'skipped';
   }
-  if (!force && !poolIsIdle()) {
+  const hooks = poolHooks;
+  const hasExclusive = hooks && typeof hooks.acquireExclusive === 'function';
+  if ((!force || hasExclusive) && !poolIsIdle()) {
     sessionHealth.recordSkip('queue_busy');
     return 'skipped';
   }
@@ -3867,7 +3877,18 @@ async function checkSessionOnce({ force = false } = {}) {
   }
   // Fewer attempts than the request path: this is a background poll, and the request path
   // may be waiting on this exact promise.
-  const probe = probeSessionState(p, { attempts: Math.min(2, SESSION_PROBE_ATTEMPTS) });
+  sessionProbePage = p;
+  // Publish the lease before acquisition can settle, so another tick cannot queue
+  // a second exclusive. There is no await between the idle check and acquisition.
+  const probe = (async () => {
+    let release;
+    try {
+      if (hasExclusive) release = await hooks.acquireExclusive('watchdog');
+      return await probeSessionState(p, { attempts: Math.min(2, SESSION_PROBE_ATTEMPTS) });
+    } finally {
+      if (typeof release === 'function') release();
+    }
+  })();
   sessionProbeInFlight = probe;
   let state = 'unknown';
   try {
@@ -3876,7 +3897,10 @@ async function checkSessionOnce({ force = false } = {}) {
     console.log('[session-watchdog] probe error:', e.message);
     state = 'unknown';
   } finally {
-    if (sessionProbeInFlight === probe) sessionProbeInFlight = null;
+    if (sessionProbeInFlight === probe) {
+      sessionProbeInFlight = null;
+      sessionProbePage = null;
+    }
   }
   sessionHealth.recordProbe(state, 'watchdog');
   if (state !== 'in') {

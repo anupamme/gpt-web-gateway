@@ -1,4 +1,4 @@
-// Kills the parallel-tabs regressions named in the M2 spec.
+// Kills the M2 regressions, all 18 independent-review survivors, and D1–D7 from M3.
 // rc=0 only when every fragment is unique, the clean target test is green,
 // the mutated tree fails that test, and the original bytes are restored.
 const crypto = require('crypto');
@@ -65,15 +65,241 @@ const mutations = [
     from: 'const key = strikeKey(mode, slotId);',
     to: 'const key = strikeKey(mode, 0);',
   },
+  {
+    "id": "I01",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "    acceptSseChunk(slot, streamId, chunk);",
+    "to": "    acceptSseChunk(getSlot(1 - slot.id), streamId, chunk);",
+    "killedBy": "page SSE bindings deliver chunks to both owning slots"
+  },
+  {
+    "id": "I02",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "        rememberConversation(slot, snap);",
+    "to": "        rememberConversation(getSlot(1 - slot.id), snap);",
+    "killedBy": "page response listeners keep conversation GETs on both owning slots"
+  },
+  {
+    "id": "I04",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "async function recreatePage(stale) {\n  const slot = slotOf(stale);",
+    "to": "async function recreatePage(stale) {\n  const slot = slotOf(stale);\n  resetPage(getSlot(1 - slot.id));",
+    "killedBy": "recreating either bound page preserves the neighbouring page and recovery state"
+  },
+  {
+    "id": "I06",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "await runOrDefer('hard-reset', () => hardResetBrowser(), slot, {\n      exclusive: false,",
+    "to": "await runOrDefer('hard-reset', () => hardResetBrowser(), slot, {\n      exclusive: true,",
+    "killedBy": "hard recovery inside a job requests maintenance before destroying either page"
+  },
+  {
+    "id": "I08",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "    requestMaintenanceNoAwait(name, fn, slot.epoch);\n    const err = new Error(opts.message);",
+    "to": "    require('./browser').clearSession();\n    requestMaintenanceNoAwait(name, fn, slot.epoch);\n    const err = new Error(opts.message);",
+    "killedBy": "deferred auto-login leaves the shared cookie jar and both pages intact"
+  },
+  {
+    "id": "I09",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "      if (err && err.retryAfterMaintenance) throw err;",
+    "to": "      if (err && err.retryAfterMaintenance) delete err.retryAfterMaintenance;",
+    "killedBy": "completeText returns a maintenance marker without consuming its retry flag"
+  },
+  {
+    "id": "I10",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "  Promise.resolve(pending).catch((err) => {\n    console.log(`[chatgpt] maintenance ${name} failed: ${err && err.message ? err.message : err}`);\n  });",
+    "to": "  Promise.resolve(pending);",
+    "killedBy": "rejected background maintenance is observed without unhandled rejection"
+  },
+  {
+    "id": "I11",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "    sessionHealth.invalidate(`login_failed:${err.loginBlocker}`);\n    throw err;\n  } finally {\n    resetAllSlotPages();",
+    "to": "    sessionHealth.invalidate(`login_failed:${err.loginBlocker}`);\n    throw err;\n  } finally {\n    resetPage(slot);",
+    "killedBy": "failed auto-login maintenance discards both bound slot pages"
+  },
+  {
+    "id": "I14",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "  target.pendingReset = target.recoveryState === 'probation' ? 'hard' : 'page';",
+    "to": "  target.pendingReset = getSlot(1 - target.id).recoveryState === 'probation' ? 'hard' : 'page';",
+    "killedBy": "degradation uses each bound slot own probation state in both directions"
+  },
+  {
+    "id": "I15",
+    "file": "src/routes/images.js",
+    "test": "scripts/test-parallel-routes.js",
+    "from": "heartbeat: (slotId) => progress.touch(jobIdBySlot.get(slotId)),",
+    "to": "heartbeat: (slotId) => progress.touch(),",
+    "killedBy": "I15: pacing heartbeats must refresh the job holding the waiting slot"
+  },
+  {
+    "id": "I16",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "liveness.touch(slotOf(p).jobId); // chunk boundary",
+    "to": "liveness.touch(); // chunk boundary",
+    "killedBy": "adaptive image chunk heartbeat refreshes only the job on its bound slot"
+  },
+  {
+    "id": "I17",
+    "file": "src/routes/images.js",
+    "test": "scripts/test-parallel-routes.js",
+    "from": "        progress.jobRequeued(ctx.jobId);",
+    "to": "        void ctx.jobId;",
+    "killedBy": "I17: a requeued attempt must not remain a stuck running job"
+  },
+  {
+    "id": "I20",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "      const timing = {};\n      if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();",
+    "to": "      const timing = {};",
+    "killedBy": "completeText calls beforeSubmit once after thinking capture and main-world preparation"
+  },
+  {
+    "id": "I21",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "      const thinkingMode = normalizeThinkingMode(options.thinkingMode ?? options.thinking);\n      const thinkingState = await setThinkingMode(p, thinkingMode);",
+    "to": "      if (typeof options.beforeSubmit === 'function') {\n        await options.beforeSubmit();\n        options = { ...options, beforeSubmit: undefined };\n      }\n      const thinkingMode = normalizeThinkingMode(options.thinkingMode ?? options.thinking);\n      const thinkingState = await setThinkingMode(p, thinkingMode);",
+    "killedBy": "completeText calls beforeSubmit once after thinking capture and main-world preparation"
+  },
+  {
+    "id": "I24",
+    "file": "src/routes/images.js",
+    "test": "scripts/test-parallel-routes.js",
+    "from": "    for (let i = 0; i < paced; i += 1) turnGate.finished(ctx.slotId);",
+    "to": "    for (let i = 0; i < Math.max(1, paced); i += 1) turnGate.finished(ctx.slotId);",
+    "killedBy": "I24: a failed pre-submit turn must not impose a gap on its next slot turn"
+  },
+  {
+    "id": "I27",
+    "env": { "LOGIN_TEST_FILTER": "parallel login callers" },
+    "file": "src/routes/login.js",
+    "test": "scripts/test-parallel-login.js",
+    "from": "  if (loginHold) {\n    const attempt = loginHold;",
+    "to": "  if (loginHold) {\n    await getPoolHooks().acquireExclusive('manual-login');\n    const attempt = loginHold;",
+    "killedBy": "parallel login callers share one pending exclusive and wait before using pages"
+  },
+  {
+    "id": "I28",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "tierAvailability.noteUnavailable(mode, reason, { stickyAfter: strikesNeeded, env, slotId: menuSlot.id });",
+    "to": "tierAvailability.noteUnavailable(mode, reason, { stickyAfter: strikesNeeded, env });",
+    "killedBy": "tier adapter accumulates unavailable evidence separately for both bound slots"
+  },
+  {
+    "id": "I34",
+    "file": "src/routes/login.js",
+    "test": "scripts/test-parallel-login.js",
+    "from": "    // Session changed: no tab may keep a document from before the login.\n    resetAllSlotPages();",
+    "to": "    // Session changed: no tab may keep a document from before the login.\n    void loginPage;",
+    "killedBy": "manual login save resets every slot exactly once while the exclusive is held"
+  },
+  {
+    "id": "D1",
+    "file": "src/routes/login.js",
+    "test": "scripts/test-parallel-login.js",
+    "from": "await enterManualLogin({ acquire: false });",
+    "to": "await enterManualLogin();",
+    "killedBy": "inactive login screenshot returns 409 without acquiring or creating a page"
+  },
+  {
+    "id": "D2",
+    "file": "src/routes/login.js",
+    "test": "scripts/test-parallel-login.js",
+    "from": "    loginHold = attempt;\n    const release = await acquired;",
+    "to": "    loginHold = attempt;\n    armLoginIdle();\n    const release = await acquired;",
+    "killedBy": "pending login acquisition has no idle deadline and save remains exclusive after ten minutes"
+  },
+  {
+    "id": "D3",
+    "file": "src/routes/images.js",
+    "test": "scripts/test-parallel-routes.js",
+    "from": "if (turnErr && turnErr.retryAfterMaintenance && i === 0 && out.length === 0) throw turnErr;",
+    "to": "if (turnErr && turnErr.retryAfterMaintenance) throw turnErr;",
+    "killedBy": "D3: a later image maintenance marker must preserve the completed prefix"
+  },
+  {
+    "id": "D4",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "    if (e && e === recordedLoginError && e.loginRecorded) throw e;",
+    "to": "    if (e && e.code === 'login_failed' && e.loginBlocker) throw e;",
+    "killedBy": "D4: diagnosed failure must be wrapped"
+  },
+  {
+    "id": "D4-double-record",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "    if (e && e === recordedLoginError && e.loginRecorded) throw e;",
+    "to": "    // Post-login errors are incorrectly recorded a second time.",
+    "killedBy": "post-login failure is recorded exactly once"
+  },
+  {
+    "id": "D5",
+    "file": "src/routes/images.js",
+    "test": "scripts/test-parallel-routes.js",
+    "from": "progress.touch(ctx.jobId); // per-image heartbeat",
+    "to": "progress.touch(); // per-image heartbeat",
+    "killedBy": "D5: completed images must refresh the running batch liveness"
+  },
+  {
+    "id": "D6",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "      if (hasExclusive) release = await hooks.acquireExclusive('watchdog');",
+    "to": "      // Probe without the pool exclusive.",
+    "killedBy": "D6: a job must wait for watchdog exclusive"
+  },
+  {
+    "id": "D6-busy",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "  if ((!force || hasExclusive) && !poolIsIdle()) {",
+    "to": "  if (!force && !poolIsIdle()) {",
+    "killedBy": "forced watchdog skips a busy pool before acquiring"
+  },
+  {
+    "id": "D6-release",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "      if (typeof release === 'function') release();",
+    "to": "      // Forget to release the watchdog exclusive.",
+    "killedBy": "D6: completed watchdog must release exclusive"
+  },
+  {
+    "id": "D7",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "        markSessionDegraded('session probe lease timeout', slotOf(watchedPage));\n        closeWedgedPage(watchedPage);",
+    "to": "        markSessionDegraded('session probe lease timeout', slot);\n        closeWedgedPage(slot.page);",
+    "killedBy": "D7: close the page leased by watchdog"
+  }
 ];
 
 function sha256(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
-function runTest(rel) {
+function runTest(rel, env = {}) {
   return spawnSync(process.execPath, [path.join(root, rel)], {
     cwd: root,
+    env: { ...process.env, ...env },
     encoding: 'utf8',
     timeout: 30000,
   });
@@ -94,7 +320,7 @@ for (const mutation of mutations) {
     }
   };
 
-  const clean = runTest(mutation.test);
+  const clean = runTest(mutation.test, mutation.env);
   if (clean.status !== 0) {
     console.error(`${mutation.id}: clean run failed`);
     console.error(clean.stdout);
@@ -112,15 +338,21 @@ for (const mutation of mutations) {
 
   fs.writeFileSync(filePath, text.replace(mutation.from, mutation.to));
   try {
-    const result = runTest(mutation.test);
+    const result = runTest(mutation.test, mutation.env);
     const timedOut = result.error && result.error.code === 'ETIMEDOUT';
     if (timedOut || result.status === 0) {
       console.error(`${mutation.id}: выжил${timedOut ? ' (timeout)' : ''}`);
       if (result.stdout) console.error(result.stdout);
       if (result.stderr) console.error(result.stderr);
       failed += 1;
+    } else if (result.status !== 1 || !/AssertionError|ERR_ASSERTION/.test(result.stderr) ||
+        (mutation.killedBy && !result.stderr.includes(mutation.killedBy))) {
+      console.error(`${mutation.id}: invalid kill — expected its own behavioral assertion`);
+      console.error(result.stdout);
+      console.error(result.stderr);
+      failed += 1;
     } else {
-      console.log(`${mutation.id}: убит`);
+      console.log(`${mutation.id}: убит (behavioral assertion)`);
     }
   } finally {
     restore();

@@ -27,6 +27,8 @@ function slotCapture() {
 add('an SSE chunk on one slot does not land in the other capture', () => {
   const slot0 = getSlot(0);
   const slot1 = getSlot(1);
+  bindPage(slot0, fakePage('https://chatgpt.com/'));
+  bindPage(slot1, fakePage('https://chatgpt.com/'));
   slot0.capture = slotCapture();
   slot1.capture = slotCapture();
   slot0.staleStreams = new Set();
@@ -42,6 +44,8 @@ add('an SSE chunk on one slot does not land in the other capture', () => {
 add('a conversation snapshot stays on the slot that fetched it', () => {
   const slot0 = getSlot(0);
   const slot1 = getSlot(1);
+  bindPage(slot0, fakePage('https://chatgpt.com/'));
+  bindPage(slot1, fakePage('https://chatgpt.com/'));
   slot0.lastConversationFetch = null;
   slot1.lastConversationFetch = null;
   noteConversation(slot1, { conversationId: 'slot-1-only' });
@@ -85,6 +89,8 @@ add('resetPage closes only the page of the slot it was given', () => {
 add('markHealthyCompletion of one slot leaves the other on probation', () => {
   const slot0 = getSlot(0);
   const slot1 = getSlot(1);
+  bindPage(slot0, fakePage('https://chatgpt.com/'));
+  bindPage(slot1, fakePage('https://chatgpt.com/'));
   slot0.recoveryState = 'probation';
   slot1.recoveryState = 'probation';
   slot0.menuFailures = 4;
@@ -94,6 +100,13 @@ add('markHealthyCompletion of one slot leaves the other on probation', () => {
   assert.strictEqual(slot0.menuFailures, 4);
   assert.strictEqual(slot1.recoveryState, 'healthy');
   assert.strictEqual(slot1.menuFailures, 0);
+  slot1.recoveryState = 'probation';
+  slot1.menuFailures = 3;
+  markHealthyCompletion(slot0);
+  assert.strictEqual(slot0.recoveryState, 'healthy');
+  assert.strictEqual(slot0.menuFailures, 0);
+  assert.strictEqual(slot1.recoveryState, 'probation');
+  assert.strictEqual(slot1.menuFailures, 3);
 });
 
 add('tier strikes do not add across slots or break a neighbour series', () => {
@@ -199,6 +212,10 @@ add('hardResetBrowser closes every slot page', async () => {
   assert.strictEqual(slot1.page, null);
   assert.strictEqual(slot0.pendingReset, null);
   assert.strictEqual(slot0.capture, null);
+});
+
+add('real adapter boundary scenarios', () => {
+  require('child_process').execFileSync(process.execPath, [require('path').join(__dirname, 'test-parallel-adapter.js')], { stdio: 'inherit' });
 });
 
 let finished = false;

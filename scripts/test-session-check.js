@@ -342,6 +342,10 @@ const FAST = { attempts: 3, timeoutMs: 50, delayMs: 0 };
     );
   });
 
+  const maintenance = require('child_process').spawnSync(process.execPath, [require('path').join(__dirname, 'test-parallel-watchdog.js')], { stdio: 'inherit' });
+  assert.strictEqual(maintenance.status, 0, 'parallel maintenance/watchdog regressions');
+  const login = require('child_process').spawnSync(process.execPath, [require('path').join(__dirname, 'test-parallel-login.js')], { stdio: 'inherit' });
+  assert.strictEqual(login.status, 0, 'parallel manual login regressions');
   console.log(`\nAll ${passed} session-check tests passed.`);
   process.exit(0);
 })().catch((e) => {

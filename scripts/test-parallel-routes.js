@@ -17,7 +17,7 @@ const bridge = {
 };
 const stub = {
   READ_VIA_BACKEND_API: true,
-  setPoolHooks() {},
+  setPoolHooks(hooks) { bridge.poolHooks = hooks; },
   getPoolHooks() { return null; },
   generateImage: async () => ({ contentType: 'image/png', url: 'http://example.invalid/img' }),
   editImage: async () => ({ contentType: 'image/png', url: 'http://example.invalid/img' }),
@@ -127,6 +127,49 @@ async function withRouter(env, fn) {
       server.close(resolve);
       server.closeAllConnections();
     });
+  }
+}
+
+// Inject time below the real progress detector and turn gate. The HTTP routes,
+// pool, per-job bookkeeping and heartbeat callbacks all remain production code.
+async function withProgressClock(fn, { paced = false } = {}) {
+  const progressPath = require.resolve('../src/progress');
+  const pacerPath = require.resolve('../src/pacer');
+  const realProgress = require(progressPath);
+  const realPacer = require(pacerPath);
+  const savedProgress = require.cache[progressPath];
+  const savedPacer = require.cache[pacerPath];
+  let now = 1;
+  const progress = realProgress.createProgress(() => now);
+  function replace(path, exports) {
+    const mod = new Module(path);
+    mod.filename = path;
+    mod.loaded = true;
+    mod.exports = exports;
+    require.cache[path] = mod;
+  }
+  replace(progressPath, { ...realProgress, progress });
+  if (paced) {
+    replace(pacerPath, {
+      ...realPacer,
+      createTurnGate: (options) => realPacer.createTurnGate({
+        ...options,
+        now: () => now,
+        sleep: async (ms) => { now += ms; },
+        heartbeatMs: Math.floor(realProgress.HEALTH_STUCK_MS / 2),
+      }),
+    });
+  }
+  try {
+    await fn({
+      progress,
+      advance: (ms) => { now += ms; },
+      now: () => now,
+      stuckMs: realProgress.HEALTH_STUCK_MS,
+    });
+  } finally {
+    require.cache[progressPath] = savedProgress;
+    require.cache[pacerPath] = savedPacer;
   }
 }
 
@@ -541,6 +584,209 @@ add('parallel login saves do not reset after the exclusive is released', async (
       server.closeAllConnections();
     });
   }
+});
+
+add('a later image maintenance marker preserves the completed batch prefix', async () => {
+  const original = stub.generateImage;
+  let turns = 0;
+  let maintenanceRuns = 0;
+  stub.generateImage = async (prompt, options) => {
+    turns += 1;
+    if (turns === 2) {
+      bridge.poolHooks.requestMaintenance('image-recovery', async () => { maintenanceRuns += 1; });
+      const err = new Error('tail page needs maintenance');
+      err.code = 'page_load_failed';
+      err.retryAfterMaintenance = true;
+      throw err;
+    }
+    await options.beforeSubmit();
+    return { contentType: 'image/png', url: `http://example.invalid/image-${turns}` };
+  };
+  try {
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 0,
+    }, async (port) => {
+      const result = await request(port, 'POST', '/v1/images/generations', { prompt: 'cat', n: 2 });
+      assert.strictEqual(result.status, 200, JSON.stringify(result.json));
+      assert.deepStrictEqual(result.json.data, [{ url: 'http://example.invalid/image-1' }],
+        'D3: a later image maintenance marker must preserve the completed prefix');
+      assert.strictEqual(result.json.partial, true);
+      assert.strictEqual(result.json.errors[0].index, 1);
+      assert.strictEqual(result.json.errors[0].kind, 'page_load_failed');
+      assert.strictEqual(turns, 2, 'D3: completed images must never be generated again');
+      assert.strictEqual(maintenanceRuns, 1, 'D3: requested maintenance must still run');
+    });
+  } finally {
+    stub.generateImage = original;
+  }
+});
+
+add('a first image maintenance marker retries the untouched batch', async () => {
+  const original = stub.generateImage;
+  let turns = 0;
+  stub.generateImage = async (prompt, options) => {
+    turns += 1;
+    if (turns === 1) {
+      bridge.poolHooks.requestMaintenance('image-recovery', async () => {});
+      const err = new Error('first page needs maintenance');
+      err.code = 'page_load_failed';
+      err.retryAfterMaintenance = true;
+      throw err;
+    }
+    await options.beforeSubmit();
+    return { contentType: 'image/png', url: `http://example.invalid/image-${turns}` };
+  };
+  try {
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 0,
+    }, async (port) => {
+      const result = await request(port, 'POST', '/v1/images/generations', { prompt: 'cat', n: 2 });
+      assert.strictEqual(result.status, 200, JSON.stringify(result.json));
+      assert.deepStrictEqual(result.json.data, [
+        { url: 'http://example.invalid/image-2' }, { url: 'http://example.invalid/image-3' },
+      ], 'D3: maintenance before any completed image must retry the batch');
+      assert.strictEqual(turns, 3);
+      assert.strictEqual(result.json.partial, undefined);
+    });
+  } finally {
+    stub.generateImage = original;
+  }
+});
+
+add('per-image heartbeat keeps a long batch alive with no gap', async () => {
+  await withProgressClock(async ({ progress, advance, stuckMs }) => {
+    const original = stub.generateImage;
+    let turns = 0;
+    let duringThirdTurn;
+    stub.generateImage = async (prompt, options) => {
+      await options.beforeSubmit();
+      turns += 1;
+      if (turns === 3) duringThirdTurn = progress.liveness();
+      advance(Math.floor(stuckMs * 0.6));
+      return { contentType: 'image/png', url: `http://example.invalid/image-${turns}` };
+    };
+    try {
+      await withRouter({
+        MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 0,
+      }, async (port) => {
+        const result = await request(port, 'POST', '/v1/images/generations', { prompt: 'cat', n: 3 });
+        assert.strictEqual(result.status, 200, JSON.stringify(result.json));
+        assert.deepStrictEqual(duringThirdTurn, { alive: true, reason: 'ok' },
+          'D5: completed images must refresh the running batch liveness');
+        assert.strictEqual(progress.snapshot().running_jobs, 0);
+      });
+    } finally {
+      stub.generateImage = original;
+    }
+  });
+});
+
+add('a pacing heartbeat keeps its running job alive', async () => {
+  await withProgressClock(async ({ progress, now, stuckMs }) => {
+    let verdict;
+    let waited;
+    bridge.completeText = async (prompt, options) => {
+      const started = now();
+      await options.beforeSubmit();
+      if (prompt === 'paced') {
+        waited = now() - started;
+        verdict = progress.liveness();
+      }
+      return { text: prompt, conversation_id: null };
+    };
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0,
+      MIN_JOB_GAP_SEC: stuckMs * 2 / 1000,
+    }, async (port) => {
+      const first = await request(port, 'POST', '/v1/chat/completions', { input: 'first' });
+      assert.strictEqual(first.status, 200, JSON.stringify(first.json));
+      const paced = await request(port, 'POST', '/v1/chat/completions', { input: 'paced' });
+      assert.strictEqual(paced.status, 200, JSON.stringify(paced.json));
+      assert.ok(waited > stuckMs, 'fixture must exceed the per-job stuck threshold');
+      assert.deepStrictEqual(verdict, { alive: true, reason: 'ok' },
+        'I15: pacing heartbeats must refresh the job holding the waiting slot');
+      assert.strictEqual(progress.snapshot().running_jobs, 0);
+    });
+  }, { paced: true });
+});
+
+add('a maintenance requeue removes the old running heartbeat', async () => {
+  await withProgressClock(async ({ progress, advance, stuckMs }) => {
+    let releaseMaintenance;
+    const maintenanceGate = new Promise((resolve) => { releaseMaintenance = resolve; });
+    let maintenanceStarted = false;
+    const ids = [];
+    bridge.completeText = async (prompt, options) => {
+      ids.push(options.job.jobId);
+      if (ids.length === 1) {
+        bridge.poolHooks.requestMaintenance('held-recovery', async () => {
+          maintenanceStarted = true;
+          await maintenanceGate;
+        });
+        const err = new Error('page needs maintenance before submit');
+        err.code = 'page_load_failed';
+        err.retryAfterMaintenance = true;
+        throw err;
+      }
+      await options.beforeSubmit();
+      return { text: prompt, conversation_id: null };
+    };
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 0,
+    }, async (port) => {
+      const pending = request(port, 'POST', '/v1/chat/completions', { input: 'retry' });
+      pending.catch(() => {});
+      try {
+        await waitUntil(() => maintenanceStarted, 'maintenance holds returned job');
+        advance(stuckMs + 1);
+        progress.touch(); // A healthy maintenance pass keeps the shared queue alive.
+        assert.deepStrictEqual(progress.liveness(), { alive: true, reason: 'ok' },
+          'I17: a requeued attempt must not remain a stuck running job');
+        assert.strictEqual(progress.snapshot().running_jobs, 0);
+        assert.strictEqual(progress.snapshot().queue_size, 1, 'the waiting request remains admitted');
+        releaseMaintenance();
+        const result = await pending;
+        assert.strictEqual(result.status, 200, JSON.stringify(result.json));
+        assert.strictEqual(ids.length, 2);
+        assert.notStrictEqual(ids[0], ids[1], 'the retry must receive a new running id');
+        assert.strictEqual(progress.snapshot().running_jobs, 0);
+        assert.strictEqual(progress.snapshot().queue_size, 0);
+        assert.deepStrictEqual(progress.liveness(), { alive: true, reason: 'ok' });
+      } finally {
+        releaseMaintenance();
+      }
+    });
+  });
+});
+
+add('a pre-submit failure does not charge the next turn on the same slot', async () => {
+  await withProgressClock(async ({ now }) => {
+    const slots = [];
+    let nextWait;
+    bridge.completeText = async (prompt, options) => {
+      slots.push(options.job.slotId);
+      if (prompt === 'fail-before-submit') {
+        const err = new Error('page failed before submit');
+        err.code = 'page_load_failed';
+        throw err;
+      }
+      const started = now();
+      await options.beforeSubmit();
+      nextWait = now() - started;
+      return { text: prompt, conversation_id: null };
+    };
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 1, MAX_QUEUE_SIZE: 1, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 10,
+    }, async (port) => {
+      const failed = await request(port, 'POST', '/v1/chat/completions', { input: 'fail-before-submit' });
+      assert.strictEqual(failed.status, 503, JSON.stringify(failed.json));
+      const next = await request(port, 'POST', '/v1/chat/completions', { input: 'next' });
+      assert.strictEqual(next.status, 200, JSON.stringify(next.json));
+      assert.deepStrictEqual(slots, [0, 0]);
+      assert.strictEqual(nextWait, 0,
+        'I24: a failed pre-submit turn must not impose a gap on its next slot turn');
+    });
+  }, { paced: true });
 });
 
 let finished = false;

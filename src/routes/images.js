@@ -596,7 +596,7 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
             job,
             beforeSubmit,
           }));
-          progress.touch(); // per-image heartbeat — long legit batches must not look stuck
+          progress.touch(ctx.jobId); // per-image heartbeat — long legit batches must not look stuck
           if (i === 0 && result.applied) firstApplied = result.applied;
           if (result.applied) turnTiers.push(result.applied);
           if (result.applied && result.applied.ab_variants > maxAbVariants) {
@@ -615,10 +615,10 @@ router.post('/v1/images/generations', maybeMultipartGen, async (req, res) => {
           }
           out.push(item);
         } catch (turnErr) {
-          // A maintenance marker has to reach the pool so the job can return to
-          // the head. Swallowing it as a partial batch would finish the job
-          // while the browser reset is still queued.
-          if (turnErr && turnErr.retryAfterMaintenance) throw turnErr;
+          // Only an untouched batch can return to the queue head. Once an image
+          // succeeded, keep that result and report the failed tail as partial;
+          // maintenance was already requested by the adapter.
+          if (turnErr && turnErr.retryAfterMaintenance && i === 0 && out.length === 0) throw turnErr;
           // Bug #4 (Opus): partial batch failure used to throw out of the job and lose
           // every already-saved image (disk leak + lost results). Now we record the
           // error per-turn and continue, returning `partial: true` if some succeeded.
