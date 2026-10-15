@@ -55,7 +55,7 @@ const mutations = [
     id: '7',
     file: 'src/pacer.js',
     test: 'scripts/test-pacer.js',
-    from: '      lastReservedStart = start;\n',
+    from: '    lastReservedStart = start;\n',
     to: '',
   },
   {

@@ -310,7 +310,7 @@ add('a second retryAfterMaintenance rejects the job', async () => {
   const job = pool.submit(async () => {
     starts += 1;
     if (starts > 2) return 'kept-going';
-    if (starts === 1) pool.requestMaintenance('reset', async () => {});
+    pool.requestMaintenance('reset', async () => {});
     const err = new Error(`try-${starts}`);
     err.retryAfterMaintenance = true;
     throw err;
@@ -348,6 +348,58 @@ add('a requeued job does not count against maxWaiting', async () => {
   assert.strictEqual(pool.isFull(), true);
   releaseMaint();
   assert.deepStrictEqual(await Promise.all([a, b]), ['a', 'b']);
+});
+
+add('retry waits for maintenance before the same job starts again', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 5 });
+  const seen = [];
+  let release;
+  const job = pool.submit(async ({ epoch }) => {
+    seen.push(epoch);
+    if (seen.length === 1) {
+      await new Promise((resolve) => { release = resolve; });
+      const err = new Error('later');
+      err.retryAfterMaintenance = true;
+      throw err;
+    }
+    return 'done';
+  });
+  const other = pool.submit(async () => 'other');
+  await flush();
+  release();
+  await flush();
+  assert.deepStrictEqual(seen, [0]);
+  assert.strictEqual(await other, 'other');
+  await pool.requestMaintenance('reset', async () => 'serviced');
+  assert.strictEqual(await job, 'done');
+  assert.deepStrictEqual(seen, [0, 1]);
+});
+
+add('two acquireExclusive calls do not share a release', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 5 });
+  const firstP = pool.acquireExclusive('login');
+  const secondP = pool.acquireExclusive('login');
+  assert.notStrictEqual(firstP, secondP);
+  const release1 = await firstP;
+  let secondStarted = false;
+  const secondWait = secondP.then((release) => {
+    secondStarted = true;
+    return release;
+  });
+  await flush();
+  assert.strictEqual(secondStarted, false);
+  assert.strictEqual(pool.status().maintenance.active, 'login');
+  release1();
+  const release2 = await secondWait;
+  assert.notStrictEqual(release1, release2);
+  let started = false;
+  const job = pool.submit(async () => { started = true; return 'job'; });
+  await flush();
+  assert.strictEqual(started, false);
+  assert.strictEqual(pool.status().epoch, 1);
+  release2();
+  assert.strictEqual(await job, 'job');
+  assert.strictEqual(pool.status().epoch, 2);
 });
 
 add('acquireExclusive holds the pool until release and a second release is a no-op', async () => {

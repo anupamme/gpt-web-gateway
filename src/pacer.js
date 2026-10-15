@@ -172,6 +172,10 @@ function createTurnGate({
   // Null until the first reservation. The first turn of an idle gate must not
   // pay the stagger: there is no peer it could land on top of.
   let lastReservedStart = null;
+  // When the gate actually returned. A late timer can land after several
+  // reservations; the next return has to be >= stagger after this release,
+  // not after a reservation that is already in the past.
+  let lastReleasedAt = null;
   let throttledMs = 0;
 
   function checkSlot(slotId) {
@@ -180,32 +184,48 @@ function createTurnGate({
     }
   }
 
-  // Beat while waiting, and keep shrinking the remainder even if the clock
-  // does not move. A stalled clock must not hold the slot forever.
-  async function waitUntil(target, planned) {
-    let pending = planned;
-    const beat = heartbeatMs > 0 ? heartbeatMs : Math.max(planned, 1);
-    while (pending > 0) {
-      const slice = Math.min(pending, beat);
-      await sleep(slice);
-      heartbeat();
-      pending = Math.min(Math.max(0, target - now()), pending - slice);
+  function reserve(at) {
+    const start = lastReservedStart === null ? at : Math.max(at, lastReservedStart + stagger);
+    lastReservedStart = start;
+    return start;
+  }
+
+  // Reserve before the first await so two callers that reach here without
+  // awaiting between them cannot take the same start. On wake, if `now` is
+  // already past that start, only this caller leaves: everyone else waits a
+  // fresh stagger from the actual release. A clock that never moves still
+  // returns after the slices we asked to sleep, or the wait would spin.
+  async function awaitStagger() {
+    let waited = 0;
+    const beat = heartbeatMs > 0 ? heartbeatMs : 1;
+    let start = reserve(now());
+    for (;;) {
+      const earliest = lastReleasedAt === null ? start : lastReleasedAt + stagger;
+      const due = Math.max(start, earliest);
+      if (now() >= due) {
+        const releasedAt = Math.max(start, now());
+        lastReleasedAt = releasedAt;
+        if (lastReservedStart < releasedAt) lastReservedStart = releasedAt;
+        return waited;
+      }
+      let guard = due - now();
+      const planned = due;
+      while (guard > 0 && now() < planned) {
+        const slice = Math.min(guard, beat);
+        await sleep(slice);
+        heartbeat();
+        waited += slice;
+        guard = Math.min(Math.max(0, planned - now()), guard - slice);
+      }
+      if (now() < planned) return waited;
     }
-    return planned;
   }
 
   return {
     async gate(slotId) {
       checkSlot(slotId);
       const gapWaited = await pacers[slotId].gate();
-      // Reserve before the first await of the stagger wait. Two gate() calls
-      // that reach this line without awaiting between them cannot take the
-      // same start: the assignment is synchronous.
-      const t = now();
-      const start = lastReservedStart === null ? t : Math.max(t, lastReservedStart + stagger);
-      lastReservedStart = start;
-      const staggerWaited = Math.max(0, start - t);
-      await waitUntil(start, staggerWaited);
+      const staggerWaited = await awaitStagger();
       throttledMs += gapWaited + staggerWaited;
       return gapWaited + staggerWaited;
     },

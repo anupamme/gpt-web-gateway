@@ -51,6 +51,9 @@ function createJobPool({ concurrency, maxWaiting }) {
   function takeNextEligible() {
     for (let i = 0; i < waiting.length; i += 1) {
       const job = waiting[i];
+      // A retry is not eligible until some maintenance has completed. Starting
+      // it again at the same epoch would burn the only retry for nothing.
+      if (job.holdEpoch !== undefined && epoch <= job.holdEpoch) continue;
       if (job.key != null && keyIsBusy(job.key)) continue;
       waiting.splice(i, 1);
       return job;
@@ -109,8 +112,13 @@ function createJobPool({ concurrency, maxWaiting }) {
   }
 
   function enqueueMaintenance(name, kind, fn) {
-    const pending = maintenanceQueue.find((entry) => entry.name === name && entry.kind === kind);
-    if (pending) return pending.promise;
+    // Function maintenance merges: one reset serves every waiter. An exclusive
+    // hold must not merge — callers would share one release(), and the first
+    // of them would open the pool while the other was still inside.
+    if (kind === 'fn') {
+      const pending = maintenanceQueue.find((entry) => entry.name === name && entry.kind === kind);
+      if (pending) return pending.promise;
+    }
     let resolve;
     let reject;
     const promise = new Promise((res, rej) => {
@@ -141,6 +149,7 @@ function createJobPool({ concurrency, maxWaiting }) {
     const error = outcome.ok ? null : outcome.error;
     if (error && error.retryAfterMaintenance === true && job.returned !== true) {
       job.returned = true;
+      job.holdEpoch = epoch;
       waiting.unshift(job);
     } else if (outcome.ok) {
       job.resolve(outcome.value);

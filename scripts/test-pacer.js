@@ -251,6 +251,14 @@ add('two concurrent gates on different slots start at least stagger apart', asyn
   assert.ok(second >= 10000, `second gate waited ${second}`);
 });
 
+add('three concurrent gates keep a stagger between each reserved start', async () => {
+  const { gate } = gateHarness({ slots: 3, gap: 0, stagger: 10000, heartbeatMs: 30000 });
+  const [first, second, third] = await Promise.all([gate.gate(0), gate.gate(1), gate.gate(2)]);
+  assert.strictEqual(first, 0);
+  assert.ok(second >= 10000, `second gate waited ${second}`);
+  assert.ok(third >= 10000, `third gate waited ${third}`);
+});
+
 add('one slot gap does not hold another slot beyond the stagger', async () => {
   const { gate } = gateHarness({ slots: 2, gap: 60000, stagger: 10000, heartbeatMs: 30000 });
   assert.strictEqual(await gate.gate(0), 0);
@@ -268,6 +276,57 @@ add('finished on slot 0 does not arm the gap of slot 1', async () => {
   assert.strictEqual(await gate.gate(0), 0);
   gate.finished(0);
   assert.strictEqual(await gate.gate(1), 10000);
+});
+
+add('a late timer does not release two staggered gates together', async () => {
+  // Reservations at 10s and 20s are both overdue when the clock jumps to
+  // 20,001s. The first gate to resume claims that instant; the other must
+  // still be waiting, then leave at least one stagger later.
+  let t = 0;
+  const pending = [];
+  const now = () => t;
+  const sleep = (ms) => new Promise((resolve) => { pending.push({ ms, resolve }); });
+  const gate = createTurnGate({
+    slots: 3, now, sleep, gap: 0, stagger: 10000, heartbeat: () => {}, heartbeatMs: 10000,
+  });
+  const marks = [];
+  const all = Promise.all([0, 1, 2].map((slotId) => gate.gate(slotId).then(() => marks.push(t))));
+  const idle = () => new Promise((resolve) => setImmediate(resolve));
+
+  await idle();
+  assert.deepStrictEqual(marks, [0], `early marks ${marks}`);
+  assert.strictEqual(pending.length, 2);
+
+  t = 20001;
+  for (const timer of pending.splice(0)) timer.resolve();
+  await idle();
+  assert.deepStrictEqual(marks, [0, 20001], `late marks ${marks}`);
+  assert.strictEqual(pending.length, 1, 'the third gate must still be waiting');
+
+  const rest = pending.splice(0);
+  t += rest[0].ms;
+  for (const timer of rest) timer.resolve();
+  await idle();
+  await all;
+  assert.strictEqual(marks.length, 3);
+  assert.ok(marks[1] - marks[0] >= 10000, `marks ${marks}`);
+  assert.ok(marks[2] - marks[1] >= 10000, `marks ${marks}`);
+});
+
+add('a stalled clock still releases a stagger wait', async () => {
+  let t = 0;
+  const slept = [];
+  const gate = createTurnGate({
+    slots: 1,
+    now: () => t,
+    sleep: (ms) => { slept.push(ms); return Promise.resolve(); },
+    gap: 0,
+    stagger: 10000,
+    heartbeatMs: 10000,
+  });
+  assert.strictEqual(await gate.gate(0), 0);
+  assert.strictEqual(await gate.gate(0), 10000);
+  assert.deepStrictEqual(slept, [10000]);
 });
 
 add('stagger 0 does not delay a turn', async () => {
