@@ -72,4 +72,43 @@ ok('repeated partial-batch infra tails accumulate despite job successes', () => 
   assert.strictEqual(p.liveness().alive, true);
 });
 
+ok('a stuck job is dead while a neighbor job is making progress', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobRunning('a');
+  p.jobRunning('b');
+  clock.advance(901 * 1000);
+  p.touch('b');
+  const verdict = p.liveness();
+  assert.strictEqual(verdict.alive, false);
+  assert.ok(verdict.reason.includes('job a'), verdict.reason);
+  assert.ok(verdict.reason.includes('901'), verdict.reason);
+  const snap = p.snapshot();
+  assert.strictEqual(snap.running_jobs, 2);
+  assert.strictEqual(snap.oldest_job_ms_since_progress, 901 * 1000);
+});
+
+ok('jobFinished drops the job so it no longer fails liveness', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobRunning('a');
+  clock.advance(901 * 1000);
+  p.jobFinished(null, 'a');
+  assert.strictEqual(p.liveness().alive, true);
+  assert.strictEqual(p.snapshot().running_jobs, 0);
+  assert.strictEqual(p.snapshot().oldest_job_ms_since_progress, null);
+});
+
+ok('touch() and jobStarted() keep the previous liveness contract', () => {
+  const clock = fakeClock();
+  const p = createProgress(clock);
+  p.jobStarted();
+  clock.advance(901 * 1000);
+  assert.strictEqual(p.liveness().alive, false);
+  p.touch();
+  assert.strictEqual(p.liveness().alive, true);
+  assert.strictEqual(p.snapshot().running_jobs, 0);
+  assert.strictEqual(p.snapshot().oldest_job_ms_since_progress, null);
+});
+
 console.log(`\nAll ${passed} progress tests passed.`);

@@ -141,6 +141,95 @@ function createPacer({
   };
 }
 
+const DEFAULT_STAGGER_MS = 10 * 1000;
+
+// Minimum gap between the moments two different slots may START an upstream
+// turn. 0 turns the spacing off. Distinct from the per-slot finish gap.
+function staggerMs(env = process.env) {
+  const raw = String(env.MIN_TURN_STAGGER_SEC ?? '').trim();
+  if (!raw) return DEFAULT_STAGGER_MS;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed >= 0) return Math.round(parsed * 1000);
+  console.warn(`[pacer] MIN_TURN_STAGGER_SEC="${raw}" is not a number — using ${DEFAULT_STAGGER_MS / 1000}s`);
+  return DEFAULT_STAGGER_MS;
+}
+
+function createTurnGate({
+  slots,
+  now = Date.now,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  gap = gapMs(),
+  stagger = staggerMs(),
+  heartbeat = () => {},
+  heartbeatMs = heartbeatMsFor(),
+} = {}) {
+  if (!Number.isInteger(slots) || slots < 1) {
+    throw new TypeError('slots must be an integer >= 1');
+  }
+  const pacers = Array.from({ length: slots }, () => (
+    createPacer({ now, sleep, gap, heartbeat, heartbeatMs })
+  ));
+  // Null until the first reservation. The first turn of an idle gate must not
+  // pay the stagger: there is no peer it could land on top of.
+  let lastReservedStart = null;
+  let throttledMs = 0;
+
+  function checkSlot(slotId) {
+    if (!Number.isInteger(slotId) || slotId < 0 || slotId >= slots) {
+      throw new RangeError(`slotId ${slotId} is outside [0, ${slots})`);
+    }
+  }
+
+  // Beat while waiting, and keep shrinking the remainder even if the clock
+  // does not move. A stalled clock must not hold the slot forever.
+  async function waitUntil(target, planned) {
+    let pending = planned;
+    const beat = heartbeatMs > 0 ? heartbeatMs : Math.max(planned, 1);
+    while (pending > 0) {
+      const slice = Math.min(pending, beat);
+      await sleep(slice);
+      heartbeat();
+      pending = Math.min(Math.max(0, target - now()), pending - slice);
+    }
+    return planned;
+  }
+
+  return {
+    async gate(slotId) {
+      checkSlot(slotId);
+      const gapWaited = await pacers[slotId].gate();
+      // Reserve before the first await of the stagger wait. Two gate() calls
+      // that reach this line without awaiting between them cannot take the
+      // same start: the assignment is synchronous.
+      const t = now();
+      const start = lastReservedStart === null ? t : Math.max(t, lastReservedStart + stagger);
+      lastReservedStart = start;
+      const staggerWaited = Math.max(0, start - t);
+      await waitUntil(start, staggerWaited);
+      throttledMs += gapWaited + staggerWaited;
+      return gapWaited + staggerWaited;
+    },
+
+    finished(slotId) {
+      checkSlot(slotId);
+      pacers[slotId].finished();
+    },
+
+    status() {
+      return {
+        min_gap_sec: gap / 1000,
+        min_stagger_sec: stagger / 1000,
+        throttled_seconds_total: Math.round(throttledMs / 1000),
+        slots: pacers.map((pacer, slotId) => ({
+          slotId,
+          next_slot_in_sec: pacer.status().next_slot_in_sec,
+        })),
+      };
+    },
+  };
+}
+
 module.exports = {
   createPacer, gapMs, heartbeatMsFor, DEFAULT_GAP_MS, HEARTBEAT_MS,
+  createTurnGate, staggerMs, DEFAULT_STAGGER_MS,
 };

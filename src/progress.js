@@ -29,14 +29,36 @@ function createProgress(now = Date.now) {
     // these are tracked independently and cleared only by an explicitly-full success.
     partialInfraStreak: 0,
   };
+  // Per running job. The shared lastProgressAt stays fresh when a neighbor polls,
+  // which would hide one wedged slot. Each job keeps its own stamp.
+  const runningJobs = new Map();
+
+  function oldestJobMs() {
+    let oldest = null;
+    for (const at of runningJobs.values()) {
+      const ms = now() - at;
+      if (oldest === null || ms > oldest) oldest = ms;
+    }
+    return oldest;
+  }
 
   return {
     // Any observable liveness: job start/finish, successful page poll, per-image turn.
-    touch() { state.lastProgressAt = now(); },
+    // With a jobId, also refreshes that running job. Unknown ids do not create one.
+    touch(jobId) {
+      state.lastProgressAt = now();
+      if (jobId !== undefined && runningJobs.has(jobId)) runningJobs.set(jobId, now());
+    },
     jobStarted() { state.queueSize++; state.lastProgressAt = now(); },
-    jobFinished(errorKind = null) {
+    // The job actually holds a slot now, as opposed to merely sitting in the queue.
+    jobRunning(jobId) {
+      runningJobs.set(jobId, now());
+      state.lastProgressAt = now();
+    },
+    jobFinished(errorKind = null, jobId) {
       state.queueSize = Math.max(0, state.queueSize - 1);
       state.lastProgressAt = now();
+      if (jobId !== undefined) runningJobs.delete(jobId);
       if (errorKind === null) {
         state.consecutiveInfraFailures = 0;
       } else if (INFRA_ERROR_KINDS.has(errorKind)) {
@@ -59,6 +81,8 @@ function createProgress(now = Date.now) {
         ms_since_progress: now() - state.lastProgressAt,
         consecutive_infra_failures: state.consecutiveInfraFailures,
         partial_infra_streak: state.partialInfraStreak,
+        running_jobs: runningJobs.size,
+        oldest_job_ms_since_progress: oldestJobMs(),
       };
     },
     // Liveness verdict. { alive, reason }
@@ -66,6 +90,12 @@ function createProgress(now = Date.now) {
       const msSince = now() - state.lastProgressAt;
       if (state.queueSize > 0 && msSince > HEALTH_STUCK_MS) {
         return { alive: false, reason: `queued work but no progress for ${Math.round(msSince / 1000)}s` };
+      }
+      for (const [id, at] of runningJobs) {
+        const jobMs = now() - at;
+        if (jobMs > HEALTH_STUCK_MS) {
+          return { alive: false, reason: `job ${id} no progress for ${Math.round(jobMs / 1000)}s` };
+        }
       }
       if (state.consecutiveInfraFailures >= HEALTH_FAILURE_STREAK) {
         return { alive: false, reason: `${state.consecutiveInfraFailures} consecutive infra failures` };

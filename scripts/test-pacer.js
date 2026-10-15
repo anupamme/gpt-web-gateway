@@ -1,6 +1,9 @@
 // Fake-clock tests for src/pacer.js — the proactive gap between jobs.
 const assert = require('assert');
-const { createPacer, gapMs, heartbeatMsFor, DEFAULT_GAP_MS, HEARTBEAT_MS } = require('../src/pacer');
+const {
+  createPacer, gapMs, heartbeatMsFor, DEFAULT_GAP_MS, HEARTBEAT_MS,
+  createTurnGate, staggerMs, DEFAULT_STAGGER_MS,
+} = require('../src/pacer');
 
 let passed = 0;
 function ok(name, fn) {
@@ -220,6 +223,106 @@ add('MIN_JOB_GAP_SEC is read from the environment', () => {
   assert.strictEqual(gapMs({ MIN_JOB_GAP_SEC: '30' }), 30000);
   assert.strictEqual(gapMs({ MIN_JOB_GAP_SEC: '0' }), 0);
   assert.strictEqual(gapMs({ MIN_JOB_GAP_SEC: '2.5' }), 2500);
+});
+
+function gateHarness({ slots = 2, gap = 0, stagger = 10000, heartbeatMs = 30000, startMs = 0 } = {}) {
+  let t = startMs;
+  const slept = [];
+  const beats = [];
+  const now = () => t;
+  const sleep = (ms) => { slept.push(ms); t += ms; return Promise.resolve(); };
+  const heartbeat = () => beats.push(t);
+  const gate = createTurnGate({ slots, now, sleep, gap, stagger, heartbeat, heartbeatMs });
+  return { gate, slept, beats, advance: (ms) => { t += ms; } };
+}
+
+add('the first turn in an empty gate is not delayed', async () => {
+  const { gate, slept } = gateHarness({ stagger: 10000, gap: 60000 });
+  assert.strictEqual(await gate.gate(0), 0);
+  assert.deepStrictEqual(slept, []);
+});
+
+add('two concurrent gates on different slots start at least stagger apart', async () => {
+  // Reservation is synchronous after each slot's own gap and before the stagger
+  // wait, so the second caller observes the first caller's reserved start.
+  const { gate } = gateHarness({ slots: 2, gap: 0, stagger: 10000, heartbeatMs: 30000 });
+  const [first, second] = await Promise.all([gate.gate(0), gate.gate(1)]);
+  assert.strictEqual(first, 0);
+  assert.ok(second >= 10000, `second gate waited ${second}`);
+});
+
+add('one slot gap does not hold another slot beyond the stagger', async () => {
+  const { gate } = gateHarness({ slots: 2, gap: 60000, stagger: 10000, heartbeatMs: 30000 });
+  assert.strictEqual(await gate.gate(0), 0);
+  gate.finished(0);
+  assert.strictEqual(await gate.gate(1), 10000);
+});
+
+add('finished on slot 0 does not arm the gap of slot 1', async () => {
+  const { gate, advance } = gateHarness({ slots: 2, gap: 60000, stagger: 10000, heartbeatMs: 60000 });
+  await gate.gate(0);
+  await gate.gate(1);
+  gate.finished(0);
+  gate.finished(1);
+  advance(120000);
+  assert.strictEqual(await gate.gate(0), 0);
+  gate.finished(0);
+  assert.strictEqual(await gate.gate(1), 10000);
+});
+
+add('stagger 0 does not delay a turn', async () => {
+  const { gate, slept } = gateHarness({ slots: 2, gap: 0, stagger: 0 });
+  assert.strictEqual(await gate.gate(0), 0);
+  assert.strictEqual(await gate.gate(1), 0);
+  assert.deepStrictEqual(slept, []);
+});
+
+add('the stagger wait beats a heartbeat', async () => {
+  const { gate, beats } = gateHarness({ slots: 2, gap: 0, stagger: 25000, heartbeatMs: 10000 });
+  await Promise.all([gate.gate(0), gate.gate(1)]);
+  assert.strictEqual(beats.length, 3);
+});
+
+add('slotId outside the gate throws RangeError', async () => {
+  const { gate } = gateHarness({ slots: 2 });
+  await assert.rejects(gate.gate(-1), RangeError);
+  await assert.rejects(gate.gate(2), RangeError);
+  await assert.rejects(gate.gate(1.5), RangeError);
+  assert.throws(() => gate.finished(-1), RangeError);
+  assert.throws(() => gate.finished(2), RangeError);
+});
+
+add('turn gate status reports gap, stagger, throttle and per-slot wait', async () => {
+  const { gate } = gateHarness({ slots: 2, gap: 60000, stagger: 10000, heartbeatMs: 30000 });
+  assert.strictEqual(gate.status().min_gap_sec, 60);
+  assert.strictEqual(gate.status().min_stagger_sec, 10);
+  assert.strictEqual(gate.status().throttled_seconds_total, 0);
+  assert.deepStrictEqual(gate.status().slots.map((slot) => slot.slotId), [0, 1]);
+  await gate.gate(0);
+  gate.finished(0);
+  await gate.gate(1);
+  assert.strictEqual(gate.status().throttled_seconds_total, 10);
+  assert.strictEqual(gate.status().slots[0].next_slot_in_sec, 50);
+  assert.strictEqual(gate.status().slots[1].next_slot_in_sec, 0);
+});
+
+add('MIN_TURN_STAGGER_SEC defaults to 10s, 0 disables, nonsense warns', () => {
+  assert.strictEqual(DEFAULT_STAGGER_MS, 10000);
+  assert.strictEqual(staggerMs({}), DEFAULT_STAGGER_MS);
+  assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '' }), 10000);
+  assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '0' }), 0);
+  assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '2' }), 2000);
+  assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '1.5' }), 1500);
+  const warned = [];
+  const real = console.warn;
+  console.warn = (msg) => warned.push(String(msg));
+  try {
+    assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: 'soon' }), DEFAULT_STAGGER_MS);
+    assert.strictEqual(staggerMs({ MIN_TURN_STAGGER_SEC: '-5' }), DEFAULT_STAGGER_MS);
+  } finally {
+    console.warn = real;
+  }
+  assert.strictEqual(warned.length, 2);
 });
 
 add('nonsense in MIN_JOB_GAP_SEC falls back to the default, loudly', () => {
