@@ -74,10 +74,15 @@ add('post-login failure is recorded exactly once', async () => {
   const loaded = load({ autoLogin: async () => { chat._test.bindPage(chat.getSlot(0), page({ auth: true })); } });
   chat = loaded.chat;
   chat._test.bindPage(chat.getSlot(0), page({ auth: true }));
+  const peer = page();
+  chat._test.bindPage(chat.getSlot(1), peer);
   const err = await chat.ensureLoggedIn(chat.getSlot(0), { exclusive: true }).catch((e) => e);
   assert.match(err.message, /auto-login completed but session is still not authenticated/);
   assert.strictEqual(loaded.health.loginFailures.unknown, 1, 'D4: post-check must not double count');
   assert.strictEqual(loaded.health.sessionHealth.snapshot().last_reason, 'post_login:out');
+  assert.strictEqual(chat.getSlot(0).page, null, 'N10: failed post-login check must discard its fresh page');
+  assert.strictEqual(chat.getSlot(1).page, null, 'N10: failed post-login check must discard the neighbour page');
+  assert.strictEqual(peer.isClosed(), true);
 });
 
 add('watchdog holds the pool while probing and releases it afterwards', async () => {
@@ -186,6 +191,37 @@ add('expired watchdog lease closes and degrades its page, preserving the request
   assert.strictEqual(requestSlot.page, own);
   assert.strictEqual(result, own);
   await checked;
+});
+
+add('watchdog takes exclusive before an immediately arriving job can start', async () => {
+  const { chat } = load();
+  const probe = deferred();
+  chat._test.bindPage(chat.getSlot(0), page({ probe: () => probe.promise }));
+  const pool = createJobPool({ concurrency: 2, maxWaiting: 8 });
+  chat.setPoolHooks(pool);
+  const checked = chat.checkSessionOnce({ force: true });
+  let jobStarted = false;
+  const job = pool.submit(async () => { jobStarted = true; return 'done'; });
+  try {
+    await tick();
+    assert.strictEqual(jobStarted, false, 'N19: no microtask gap is allowed between idle check and exclusive acquisition');
+  } finally {
+    probe.resolve(true);
+    await checked;
+    await job;
+  }
+});
+
+add('watchdog permits a new probe after its previous lease completes', async () => {
+  const { chat } = load();
+  let probes = 0;
+  chat._test.bindPage(chat.getSlot(0), page({ probe: () => { probes++; return true; } }));
+  const pool = createJobPool({ concurrency: 2, maxWaiting: 8 });
+  chat.setPoolHooks(pool);
+  assert.strictEqual(await chat.checkSessionOnce({ force: true }), 'in');
+  assert.strictEqual(await chat.checkSessionOnce({ force: true }), 'in', 'N21: completed watchdog lease must be cleared');
+  assert.strictEqual(probes, 2);
+  assert.strictEqual(pool.status().maintenance.active, null);
 });
 
 let finished = false;

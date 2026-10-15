@@ -789,6 +789,54 @@ add('a pre-submit failure does not charge the next turn on the same slot', async
   }, { paced: true });
 });
 
+add('a finished turn charges the gap to its own slot in a parallel pool', async () => {
+  await withProgressClock(async ({ now }) => {
+    const slots = [];
+    const waits = [];
+    bridge.completeText = async (prompt, options) => {
+      slots.push(options.job.slotId);
+      const started = now();
+      await options.beforeSubmit();
+      waits.push(now() - started);
+      return { text: prompt, conversation_id: null };
+    };
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 2, MAX_QUEUE_SIZE: 2, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 10,
+    }, async (port) => {
+      for (const input of ['first', 'next']) {
+        const result = await request(port, 'POST', '/v1/chat/completions', { input });
+        assert.strictEqual(result.status, 200, JSON.stringify(result.json));
+      }
+      assert.deepStrictEqual(slots, [0, 0]);
+      assert.deepStrictEqual(waits, [0, 10000], 'N37: a completed turn must pace its own slot, not its neighbour');
+    });
+  }, { paced: true });
+});
+
+add('infrastructure job failures reach the liveness failure streak', async () => {
+  await withProgressClock(async ({ progress }) => {
+    bridge.completeText = async () => { throw Object.assign(new Error('page failed before submit'), { code: 'page_load_failed' }); };
+    await withRouter({
+      MAX_CONCURRENT_JOBS: 2, MAX_QUEUE_SIZE: 2, MIN_TURN_STAGGER_SEC: 0, MIN_JOB_GAP_SEC: 0,
+    }, async (port) => {
+      const { HEALTH_FAILURE_STREAK } = require('../src/progress');
+      for (let i = 1; i <= HEALTH_FAILURE_STREAK; i++) {
+        const result = await request(port, 'POST', '/v1/chat/completions', { input: 'fail' });
+        assert.strictEqual(result.status, 503, JSON.stringify(result.json));
+        assert.strictEqual(progress.snapshot().consecutive_infra_failures, i,
+          'N43: submitJob must classify infrastructure failures in jobFinished');
+        assert.strictEqual(progress.snapshot().running_jobs, 0);
+      }
+      assert.strictEqual(progress.liveness().alive, false);
+      bridge.completeText = async (prompt, options) => { await options.beforeSubmit(); return { text: 'recovered', conversation_id: null }; };
+      const recovered = await request(port, 'POST', '/v1/chat/completions', { input: 'recover' });
+      assert.strictEqual(recovered.status, 200, JSON.stringify(recovered.json));
+      assert.strictEqual(progress.snapshot().consecutive_infra_failures, 0);
+      assert.deepStrictEqual(progress.liveness(), { alive: true, reason: 'ok' });
+    });
+  });
+});
+
 let finished = false;
 process.on('beforeExit', () => {
   if (!finished) {

@@ -109,6 +109,41 @@ add('markHealthyCompletion of one slot leaves the other on probation', () => {
   assert.strictEqual(slot1.menuFailures, 3);
 });
 
+add('local reset clears its conversation snapshot and preserves neighbour recovery', () => {
+  for (const id of [0, 1]) {
+    const own = getSlot(id);
+    const peer = getSlot(1 - id);
+    bindPage(own, fakePage('https://chatgpt.com/'));
+    const peerPage = fakePage('https://chatgpt.com/');
+    bindPage(peer, peerPage);
+    noteConversation(own, { conversationId: 'discarded' });
+    noteConversation(peer, { conversationId: 'preserved' });
+    peer.pendingReset = 'hard';
+    peer.staleStreams = new Set(['peer-stream']);
+    resetPage(own);
+    assert.strictEqual(own.lastConversationFetch, null, 'N02: reset must discard the old conversation GET');
+    assert.strictEqual(peer.pendingReset, 'hard', 'N06: local reset must preserve the neighbour pending reset');
+    assert.deepStrictEqual([...peer.staleStreams], ['peer-stream']);
+    assert.strictEqual(peer.lastConversationFetch.conversationId, 'preserved');
+    assert.strictEqual(peer.page, peerPage);
+    assert.strictEqual(peerPage.closed, false);
+  }
+});
+
+add('global reset clears stale streams even on a slot without a page', async () => {
+  const own = getSlot(0);
+  const empty = getSlot(1);
+  bindPage(own, fakePage('https://chatgpt.com/'));
+  resetPage(empty);
+  own.staleStreams = new Set(['old-own']);
+  empty.staleStreams = new Set(['old-empty']);
+  empty.pendingReset = 'hard';
+  await hardResetBrowser();
+  assert.strictEqual(own.staleStreams.size, 0, 'N04: global reset must forget stale streams');
+  assert.strictEqual(empty.pendingReset, null, 'N08: global reset must clear recovery on a page-less slot');
+  assert.strictEqual(empty.staleStreams.size, 0, 'N08: global reset must clear stale streams on a page-less slot');
+});
+
 add('tier strikes do not add across slots or break a neighbour series', () => {
   tierAvailability._reset();
   tierAvailability.noteUnavailable('pro', 'not-offered', { stickyAfter: 2, slotId: 0 });

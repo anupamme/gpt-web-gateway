@@ -246,6 +246,25 @@ add('same-name maintenance merges only while it is waiting to start', async () =
   assert.strictEqual(calls, 2);
 });
 
+add('different pending maintenance names each run before the next job', async () => {
+  const pool = createJobPool({ concurrency: 1, maxWaiting: 5 });
+  let release;
+  const blocker = pool.submit(() => new Promise((resolve) => { release = resolve; }));
+  await flush();
+  const order = [];
+  const reset = pool.requestMaintenance('hard-reset', async () => { order.push('reset'); return 'reset-done'; });
+  const login = pool.requestMaintenance('auto-login', async () => { order.push('login'); return 'login-done'; });
+  const next = pool.submit(async () => { order.push('job'); });
+  release();
+  await blocker;
+  const results = await Promise.all([reset, login, next]);
+  assert.deepStrictEqual(order, ['reset', 'login', 'job'], 'N15: differently named maintenance must not merge');
+  assert.deepStrictEqual(results.slice(0, 2), [
+    { skipped: false, value: 'reset-done' }, { skipped: false, value: 'login-done' },
+  ]);
+  assert.strictEqual(pool.status().epoch, 2);
+});
+
 add('sinceEpoch skips a maintenance that already completed after that epoch', async () => {
   const pool = createJobPool({ concurrency: 1, maxWaiting: 5 });
   assert.deepStrictEqual(await pool.requestMaintenance('reset', async () => 'first'), {

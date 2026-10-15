@@ -1,4 +1,4 @@
-// Kills the M2 regressions, all 18 independent-review survivors, and D1–D7 from M3.
+// Kills the M2 regressions, independent-review survivors, D1–D7, and all 15 M4 survivors.
 // rc=0 only when every fragment is unique, the clean target test is green,
 // the mutated tree fails that test, and the original bytes are restored.
 const crypto = require('crypto');
@@ -289,6 +289,127 @@ const mutations = [
     "from": "        markSessionDegraded('session probe lease timeout', slotOf(watchedPage));\n        closeWedgedPage(watchedPage);",
     "to": "        markSessionDegraded('session probe lease timeout', slot);\n        closeWedgedPage(slot.page);",
     "killedBy": "D7: close the page leased by watchdog"
+  },
+  // Exact N-series replacements from docs/specs/parallel-tabs-m3-mut-report.md.
+  {
+    "id": "N02",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-slots.js",
+    "from": "  victim.lastConversationFetch = null;",
+    "to": "  void victim.lastConversationFetch;",
+    "killedBy": "N02: reset must discard the old conversation GET"
+  },
+  {
+    "id": "N04",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-slots.js",
+    "from": "    slot.staleStreams = new Set();",
+    "to": "    void slot.staleStreams;",
+    "killedBy": "N04: global reset must forget stale streams"
+  },
+  {
+    "id": "N06",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-slots.js",
+    "from": "  victim.pagePromise = null;",
+    "to": "  victim.pagePromise = null;\n  getSlot(1 - victim.id).pendingReset = null;",
+    "killedBy": "N06: local reset must preserve the neighbour pending reset"
+  },
+  {
+    "id": "N07",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "if (cap && cap.boundStream) slot.staleStreams.add(cap.boundStream);",
+    "to": "if (cap && cap.boundStream) getSlot(1 - slot.id).staleStreams.add(cap.boundStream);",
+    "killedBy": "N07: completed stream must be stale on its owner"
+  },
+  {
+    "id": "N08",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-slots.js",
+    "from": "  for (const slot of slotsById.values()) {\n    discardSlotPage(slot);",
+    "to": "  for (const slot of slotsById.values()) {\n    if (!slot.page) continue;\n    discardSlotPage(slot);",
+    "killedBy": "N08: global reset must clear recovery on a page-less slot"
+  },
+  {
+    "id": "N09",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "return await autoLoginMaintenance(slot, 'out');\n  } finally {\n    resetAllSlotPages();",
+    "to": "return await autoLoginMaintenance(slot, 'out');\n  } finally {\n    void slot;",
+    "killedBy": "N09: context rebuild must discard its newly probed page"
+  },
+  {
+    "id": "N10",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "    throw err;\n  } finally {\n    resetAllSlotPages();\n  }\n}\n\n// ==== Traffic-independent",
+    "to": "    throw err;\n  } finally {\n    if (!recordedLoginError) resetAllSlotPages();\n  }\n}\n\n// ==== Traffic-independent",
+    "killedBy": "N10: failed post-login check must discard its fresh page"
+  },
+  {
+    "id": "N11",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "  resetAllSlotPages();\n  await closeBrowser().catch(() => {});",
+    "to": "  await closeBrowser().catch(() => {});\n  resetAllSlotPages();",
+    "killedBy": "N11: pages must be detached while browser close is pending"
+  },
+  {
+    "id": "N15",
+    "file": "src/job-pool.js",
+    "test": "scripts/test-job-pool.js",
+    "from": "entry.name === name && entry.kind === kind",
+    "to": "entry.kind === kind",
+    "killedBy": "N15: differently named maintenance must not merge"
+  },
+  {
+    "id": "N19",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "      if (hasExclusive) release = await hooks.acquireExclusive('watchdog');",
+    "to": "      if (hasExclusive) { await Promise.resolve(); release = await hooks.acquireExclusive('watchdog'); }",
+    "killedBy": "N19: no microtask gap is allowed between idle check and exclusive acquisition"
+  },
+  {
+    "id": "N21",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-watchdog.js",
+    "from": "  sessionProbeInFlight = probe;",
+    "to": "  sessionProbeInFlight = probe.then(state => state);",
+    "killedBy": "N21: completed watchdog lease must be cleared"
+  },
+  {
+    "id": "N32",
+    "file": "src/routes/login.js",
+    "test": "scripts/test-parallel-login.js",
+    "from": "saveChain = run.then(() => {}, () => {});",
+    "to": "saveChain = run;",
+    "killedBy": "N32: a rejected save chain must allow the next save to acquire"
+  },
+  {
+    "id": "N36",
+    "file": "src/chatgpt.js",
+    "test": "scripts/test-parallel-adapter.js",
+    "from": "      const timing = {};\n      if (typeof options.beforeSubmit === 'function') await options.beforeSubmit();",
+    "to": "      const timing = {};\n      if (typeof options.beforeSubmit === 'function') { await options.beforeSubmit(); await options.beforeSubmit(); }",
+    "killedBy": "N36: successful beforeSubmit must not reserve pacing twice"
+  },
+  {
+    "id": "N37",
+    "file": "src/routes/images.js",
+    "test": "scripts/test-parallel-routes.js",
+    "from": "for (let i = 0; i < paced; i += 1) turnGate.finished(ctx.slotId);",
+    "to": "for (let i = 0; i < paced; i += 1) turnGate.finished((ctx.slotId + 1) % pool.status().concurrency);",
+    "killedBy": "N37: a completed turn must pace its own slot, not its neighbour"
+  },
+  {
+    "id": "N43",
+    "file": "src/routes/images.js",
+    "test": "scripts/test-parallel-routes.js",
+    "from": "      progress.jobFinished(classifyError(err && err.message, err && err.code), ctx.jobId);",
+    "to": "      progress.jobFinished(null, ctx.jobId);",
+    "killedBy": "N43: submitJob must classify infrastructure failures in jobFinished"
   }
 ];
 

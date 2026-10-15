@@ -193,6 +193,25 @@ add('failed pending login acquisition returns 503 to every caller without touchi
   assert.strictEqual(f.timers.size, 0);
 });
 
+add('a failed login save does not poison the next save on the same router', async () => {
+  const f = fixture();
+  const failed = f.start('post', '/login/save');
+  await flush();
+  await f.reject();
+  await failed.promise;
+  assert.strictEqual(failed.status, 503);
+  const retry = f.start('post', '/login/save');
+  await flush();
+  assert.strictEqual(f.state.acquires, 2, 'N32: a rejected save chain must allow the next save to acquire');
+  await f.grant();
+  await retry.promise;
+  assert.strictEqual(retry.status, 200);
+  assert.strictEqual(f.state.saves, 1);
+  assert.strictEqual(f.state.resets, 1);
+  assert.strictEqual(f.state.unsafe, 0);
+  assert.strictEqual(f.state.held, 0);
+});
+
 add('manual login save resets every slot exactly once while the exclusive is held', async () => {
   const f = fixture();
   const save = f.start('post', '/login/save');

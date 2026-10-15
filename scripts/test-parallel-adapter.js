@@ -65,14 +65,14 @@ class Page extends EventEmitter {
   }
 }
 
-function adapter({ autoLogin = async () => { throw new Error('fake login unavailable'); }, progress } = {}) {
+function adapter({ autoLogin = async () => { throw new Error('fake login unavailable'); }, progress, closeBrowser } = {}) {
   const events = [];
   const queuedPages = [];
   const calls = { clearSession: 0, closeBrowser: 0, autoLogin: 0 };
   const browser = {
     getContext: async () => ({ newPage: async () => queuedPages.shift() || new Page('fresh', events) }),
     saveSession: async () => {},
-    closeBrowser: async () => { calls.closeBrowser++; },
+    closeBrowser: async () => { calls.closeBrowser++; if (closeBrowser) await closeBrowser(); },
     clearSession: async () => { calls.clearSession++; },
     maybeHideWebdriverOnPage: async () => {},
     browserFingerprint: {},
@@ -282,6 +282,106 @@ add('completeText calls beforeSubmit once after thinking capture and main-world 
   assert.strictEqual(hooks, 1, 'completeText must call its beforeSubmit hook exactly once');
   assert.strictEqual(err, sentinel);
   assert.deepStrictEqual(events.slice(-4), ['B:thinking', 'B:capture-state', 'B:prime', 'hook'], 'beforeSubmit must run after thinking capture and main-world preparation');
+});
+
+add('a completed capture retires its stream only on its owning slot', async () => {
+  for (const id of [0, 1]) {
+    const { chat, slots, bindPair } = adapter();
+    bindPair();
+    const sentinel = stop();
+    const err = await chat.completeText('never sent', {
+      job: { slotId: id }, reuseChat: true, thinkingMode: 'instant',
+      beforeSubmit: async () => { chat._test.acceptSseChunk(slots[id], 'retired', 'first'); throw sentinel; },
+    }).catch(e => e);
+    assert.strictEqual(err, sentinel);
+    assert.strictEqual(slots[id].capture, null);
+    assert.strictEqual(slots[id].staleStreams.has('retired'), true, 'N07: completed stream must be stale on its owner');
+    assert.strictEqual(slots[1 - id].staleStreams.has('retired'), false, 'N07: completed stream must not poison its neighbour');
+    slots.forEach(slot => { slot.capture = capture(); });
+    chat._test.acceptSseChunk(slots[id], 'retired', 'late');
+    chat._test.acceptSseChunk(slots[1 - id], 'retired', 'peer');
+    assert.strictEqual(slots[id].capture.text, '');
+    assert.strictEqual(slots[1 - id].capture.text, 'peer');
+  }
+});
+
+add('a successful beforeSubmit hook is called once before typing begins', async () => {
+  const { chat, bindPair } = adapter();
+  const pages = bindPair();
+  const sentinel = stop();
+  let hooks = 0;
+  let typing = 0;
+  const err = await chat.completeText('never sent', {
+    job: { slotId: 1 }, reuseChat: true, thinkingMode: 'instant',
+    beforeSubmit: async () => {
+      hooks++;
+      // Fail at the external composer boundary AFTER a successful hook, before sending.
+      pages[1].locator = () => ({ first: () => ({ waitFor: async () => { typing++; throw sentinel; } }) });
+    },
+  }).catch(e => e);
+  assert.strictEqual(err, sentinel);
+  assert.strictEqual(typing, 1);
+  assert.strictEqual(hooks, 1, 'N36: successful beforeSubmit must not reserve pacing twice');
+});
+
+add('hard reset detaches every page before awaiting browser close', async () => {
+  let finishClose;
+  const closing = new Promise(resolve => { finishClose = resolve; });
+  const { chat, slots, bindPair } = adapter({ closeBrowser: () => closing });
+  const pages = bindPair();
+  slots.forEach(slot => { slot.capture = capture(); });
+  const reset = chat.hardResetBrowser();
+  try {
+    // The close promise is still pending: no old page or capture may be usable.
+    assert.deepStrictEqual(slots.map(slot => slot.page), [null, null], 'N11: pages must be detached while browser close is pending');
+    assert.deepStrictEqual(slots.map(slot => slot.capture), [null, null]);
+    assert.deepStrictEqual(pages.map(p => p.closed), [true, true]);
+  } finally {
+    finishClose();
+    await reset;
+  }
+});
+
+add('context rebuild discards every page created during maintenance', async () => {
+  const saved = process.env.SESSION_UNKNOWN_ESCALATE;
+  process.env.SESSION_UNKNOWN_ESCALATE = '1';
+  let fixture;
+  try { fixture = adapter(); }
+  finally {
+    if (saved === undefined) delete process.env.SESSION_UNKNOWN_ESCALATE;
+    else process.env.SESSION_UNKNOWN_ESCALATE = saved;
+  }
+  const { chat, slots, bindPair, queuedPages } = fixture;
+  const pages = bindPair();
+  const inconclusive = p => {
+    const evaluate = p.evaluate.bind(p);
+    p.evaluate = (fn, arg) => String(fn).includes("fetch('/api/auth/session'")
+      ? Promise.resolve({ v: null }) : evaluate(fn, arg);
+    return p;
+  };
+  inconclusive(pages[0]);
+  const renavigated = inconclusive(new Page('renavigated'));
+  const rebuilt = new Page('rebuilt');
+  const peer = new Page('maintenance-peer');
+  const evaluate = rebuilt.evaluate.bind(rebuilt);
+  rebuilt.evaluate = async (fn, arg) => {
+    if (String(fn).includes("fetch('/api/auth/session'")) chat._test.bindPage(slots[1], peer);
+    return evaluate(fn, arg);
+  };
+  queuedPages.push(renavigated, rebuilt);
+  let maintenance;
+  chat.setPoolHooks({ requestMaintenance(name, fn) {
+    assert.strictEqual(name, 'context-rebuild');
+    maintenance = fn;
+    return Promise.resolve();
+  } });
+  await assert.rejects(chat.ensureLoggedIn(slots[0]), e => e.retryAfterMaintenance === true);
+  assert.strictEqual(typeof maintenance, 'function');
+  assert.strictEqual(await maintenance(), rebuilt);
+  assert.strictEqual(slots[0].page, null, 'N09: context rebuild must discard its newly probed page');
+  assert.strictEqual(slots[1].page, null, 'N09: context rebuild must discard all maintenance pages');
+  assert.strictEqual(rebuilt.closed, true);
+  assert.strictEqual(peer.closed, true);
 });
 
 add('tier adapter accumulates unavailable evidence separately for both bound slots', async () => {
