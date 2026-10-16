@@ -112,7 +112,11 @@ test('gate fails if rollback hash verification detects changed bytes', async t =
 });
 
 for (const [signal, exitCode] of [['SIGTERM', 143], ['SIGINT', 130]]) {
-  test(`gate restores all source hashes on ${signal} during a pending target`, { timeout: 10000 }, async () => {
+  test(`gate restores all source hashes on ${signal} during a pending target without filesystem watchers`, { timeout: 10000 }, async t => {
+    // Shared CI hosts can exhaust inotify resources even in a fresh container.
+    t.mock.method(fs, 'watch', () => {
+      throw Object.assign(new Error('inotify resources exhausted'), { code: 'ENOSPC' });
+    });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'stall-gate-signal-'));
     const sources = ['src/chatgpt.js', 'src/routes/images.js', 'src/server.js', 'src/log-context.js'];
     const hash = file => crypto.createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex');
@@ -136,10 +140,11 @@ if (fs.readFileSync('src/chatgpt.js', 'utf8').includes(${JSON.stringify(mutation
 }
 `);
     const readyFile = path.join(root, 'ready');
-    let watcher;
+    let readinessPoll;
     let deadline;
     const ready = new Promise((resolve, reject) => {
-      watcher = fs.watch(root, () => { if (fs.existsSync(readyFile)) resolve(); });
+      // Poll the atomically published marker; readiness must not need inotify.
+      readinessPoll = setInterval(() => { if (fs.existsSync(readyFile)) resolve(); }, 10);
       deadline = setTimeout(() => reject(new Error('mutated target did not announce readiness')), 5000);
     });
     const script = `
@@ -165,7 +170,7 @@ Promise.resolve(runGate(${JSON.stringify(root)}, [${JSON.stringify(mutation)}]))
       assert.equal(result.signal, null, 'explicit handler must finish with a nonzero exit code');
     } finally {
       clearTimeout(deadline);
-      watcher.close();
+      clearInterval(readinessPoll);
       child.kill('SIGKILL');
       await closed;
       if (fs.existsSync(readyFile)) {
