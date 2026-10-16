@@ -448,3 +448,17 @@ docker run --rm -v "$PWD":/app -w /app node:24-slim npm test
 ## License
 
 [MIT](LICENSE)
+
+## Local Docker file ownership
+
+Run Compose as the owner of the working copy. Before the first launch:
+
+```sh
+export APP_UID="$(id -u)" APP_GID="$(id -g)"
+mkdir -p auth public/images
+docker compose up -d
+```
+
+The default UID/GID is `1002:1002` (deploy on onyx). Bind sources must exist;
+Compose will fail instead of creating missing directories as root. Prepare the
+project’s `.env` and other required configuration before starting the service.
