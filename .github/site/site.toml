@@ -1,0 +1,54 @@
+# Site config for .github/site/build.py. Everything else comes from README.md.
+name = "gpt-web-gateway"
+title = "gpt-web-gateway — OpenAI-compatible API over ChatGPT web"
+headline = "OpenAI-compatible API gateway backed by the ChatGPT.com web UI"
+description = "Self-hosted gateway that drives a real ChatGPT session in Chrome: chat completions with thinking modes, image generation and editing. Docker, MIT."
+lang = "en"
+keywords = ["chatgpt api gateway", "openai-compatible api", "chatgpt web ui", "chat completions", "image generation", "patchright", "docker", "self-hosted"]
+license = "MIT"
+license_url = "https://opensource.org/license/mit"
+category = "DeveloperApplication"
+os = "Linux (Docker)"
+programming_language = "JavaScript"
+eyebrow = "Open source · MIT · Docker"
+download_url = "https://github.com/stufently/gpt-web-gateway/pkgs/container/gpt-web-gateway"
+
+# README "## <name>" sections shown on the home page, in this order (exact titles).
+landing_sections = ["Quickstart", "Endpoints", "Disclaimer"]
+
+# Extra markdown pages besides README; docs/ holds internal design notes.
+pages = ["SECURITY.md"]
+docs_dir = ""
+
+features = [
+  "OpenAI-style endpoints: /v1/chat/completions, /v1/responses, /v1/images/generations and /v1/images/edits; works with the OpenAI SDK.",
+  "Thinking modes instant, standard, extended, extra_high and pro, with an applied echo block that shows what the UI really activated.",
+  "Image generation and editing: batches up to 10, aspect ratios, reference images and multipart uploads.",
+  "Multi-turn conversations via conversation_id and OpenAI-style streaming with stream: true.",
+  "Operational hardening: request queue with Retry-After, typed errors, Prometheus metrics and a liveness endpoint with stuck detection.",
+  "One-time remote login at /login (SSO/2FA supported) or automatic login with e-mail, password and TOTP secret.",
+]
+
+[[faq]]
+q = "How do I run gpt-web-gateway?"
+a = "Build the Docker image and run it with the auth/ and images volumes mounted and API_KEY set, or copy .env.example to .env and run docker compose up -d. Then open /login once to sign in to ChatGPT; the session is saved to the auth/ volume."
+
+[[faq]]
+q = "Can I use it with the OpenAI SDK?"
+a = "Yes. Point the client at the gateway, for example base_url http://localhost:3000/v1 with your API_KEY as api_key, and call chat completions or images.generate as usual. The model field is accepted and ignored."
+
+[[faq]]
+q = "Is using it allowed by OpenAI?"
+a = "No. Automating the ChatGPT web interface violates OpenAI's Terms of Use and the account can be suspended or banned without warning. Use a dedicated account with its own Plus or Pro subscription, never your main one."
+
+[[faq]]
+q = "Does it bypass ChatGPT rate limits or the subscription?"
+a = "No. You need your own Plus or Pro subscription, the account's limits still apply, and the gateway applies cooldowns when ChatGPT rate-limits the account."
+
+[[faq]]
+q = "How do I secure the gateway?"
+a = "Never expose it without authentication: set API_KEY, put auth on your reverse proxy or bind the port to localhost. The web UI at /, generated images under /images/, /health and /metrics stay outside API_KEY by design, and the auth/ volume holds session cookies, so keep it private."
+
+[[faq]]
+q = "How many requests can it handle at once?"
+a = "Up to MAX_CONCURRENT_JOBS jobs run in parallel (1 to 5, default 3), each on its own browser tab; further jobs wait in a queue capped by MAX_QUEUE_SIZE. It is a personal or team gateway, not a high-throughput proxy."
