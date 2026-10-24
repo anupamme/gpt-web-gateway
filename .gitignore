@@ -6,3 +6,4 @@ public/images/*
 !public/images/.gitkeep
 .claude/
 scratch/
+_site/
