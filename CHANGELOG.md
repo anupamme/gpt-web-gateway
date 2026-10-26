@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.16.2 — 2026-10-26
+
+- Rebuild on Node 24.22.1 to patch CVE-2026-111497 (out-of-bounds write in the
+  Brotli decoder, "Node2Shell"/"Brocolli2Shell"): the gateway makes outbound
+  fetch() calls whose Brotli responses are auto-decompressed. Dockerfile base
+  pinned node:24-slim -> node:24.22.1-slim. No code changes.
+
 ## 2.16.1 — 2026-10-26
 
 - Ignore Stop controls in hidden workspaces when waiting for text. A retained
