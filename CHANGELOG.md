@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.16.1 — 2026-10-26
+
+- Ignore Stop controls in hidden workspaces when waiting for text. A retained
+  hidden composer previously blocked both completed answers and the existing
+  one-time reload rescue, causing false stall timeouts. Visible Stop controls
+  still block rescue and early completion; no prompt is resubmitted.
+- Add regression coverage to the text extraction suite and an offline Chromium
+  check (`node scripts/test-visible-stop.js`, with a Playwright browser installed).
+  The browser check covers hidden ancestors and each visible Stop selector.
+
 ## 2.16.0 — 2026-10-15
 
 About 15% of text jobs have stalled since 2026-10-14 ~21:00 UTC: the prompt is

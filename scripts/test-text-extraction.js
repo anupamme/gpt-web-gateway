@@ -60,3 +60,21 @@ test('an expired budget cannot return an answer while the UI is still generating
     }), (e) => e.code === 'timeout');
   });
 });
+
+for (const complete of [true, false]) {
+  test(`a hidden workspace Stop does not block ${complete ? 'completion' : 'reload rescue'}`, async () => {
+    await withPage({ finishAt: 0, complete: complete ? 'finished answer' : '' }, async page => {
+      // Model DOM presence separately from visibility, like a retained workspace.
+      page.$ = async selector => selector.split(',').some(s =>
+        s.includes('aria-label="Stop"') && !s.trim().endsWith(':visible')) ? {} : null;
+      let reloads = 0;
+      page.reload = async () => {
+        reloads++;
+        global.document.querySelectorAll = () => [{ innerText: 'finished answer', querySelector: () => ({ innerText: 'finished answer' }) }];
+      };
+      const result = await waitAndExtractText(page);
+      assert.equal(result.text, 'finished answer');
+      assert.equal(reloads, complete ? 0 : 1);
+    });
+  });
+}

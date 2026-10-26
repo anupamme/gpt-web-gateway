@@ -1684,7 +1684,9 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   }
   let deadline = start + baseBudgetMs;
   let extended = false;
-  const STOP_BTN_SELECTOR = 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop"], button[aria-label="Остановить"]';
+  // The app can retain an inactive workspace with its own Stop button in the
+  // DOM. Only a visible control can block completion or the read-only rescue.
+  const STOP_BTN_SELECTOR = 'button[data-testid="stop-button"]:visible, button[aria-label="Stop generating"]:visible, button[aria-label="Stop"]:visible, button[aria-label="Остановить"]:visible';
 
   // Stuck-generation guard state: any observable change in the assistant text or body tail
   // counts as progress. See CHAT_STALL_WINDOW_MS. Thinking modes get a doubled window —

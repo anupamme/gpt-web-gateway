@@ -84,6 +84,11 @@ git diff --cached | grep -nEi \
 
 ## Релиз
 
+При ожидании текста учитывай только видимые Stop-кнопки: скрытый workspace
+может сохранять собственный composer. Проверка видимости должна применяться
+к каждому варианту селектора, иначе она блокирует завершение и reload rescue.
+Изолированная браузерная регрессия: `node scripts/test-visible-stop.js`.
+
 Helm-чарт лежит здесь (`helm/`), а его values и ArgoCD Application — в приватном
 deploy-репозитории, вне этого проекта. Релиз: бамп `version`/`appVersion` в
 `helm/Chart.yaml` (и `package.json`) + git-тег `v*` → CI собирает и пушит образ в GHCR →
