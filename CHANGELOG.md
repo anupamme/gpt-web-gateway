@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.16.4 — 2026-10-29
+
+2.16.3 did not close the 504s on heavy text turns. On `extra_high` (and sometimes `high`
+with a long prompt) ChatGPT closes the response stream before the first answer byte and
+finishes the turn server-side. The page never renders that answer and a reload does not
+either, so the turn went reload at ~61 s → stall → 504 after ~400–514 s.
+
+- Once the response stream has closed without an answer and the conversation id is known,
+  the gateway no longer reloads. It reads the conversation from inside the page (the
+  page's own cookies and access token, the same GET the app makes) every
+  `CHAT_BG_POLL_INTERVAL_SEC` (15) until the answer of this turn is complete, then returns
+  it. Budgets count from submit: `CHAT_BG_POLL_HEAVY_SEC` 600 for `extra_high`/`pro`,
+  `CHAT_BG_POLL_THINKING_SEC` 420 for other thinking modes, `CHAT_BG_POLL_SEC` 240 for
+  instant. While polling, the stall guard and the response deadline are suspended and the
+  session is not marked degraded.
+- Only the answer to the latest user message is taken, and only when that message is
+  newer than the turn: a continuation is never answered with the previous reply.
+- The reload rescue stays as the fallback when the endpoint refuses (401/403/404), returns
+  an unknown shape, or fails three polls in a row.
+- Tests: `scripts/test-bg-poll.js` (in `npm test`).
+
 ## 2.16.3 — 2026-10-29
 
 Heavy `extra_high` text turns (22–56k-character prompts) failed with 504 "no progress

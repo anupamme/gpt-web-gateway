@@ -90,6 +90,9 @@ git diff --cached | grep -nEi \
 Изолированная браузерная регрессия: `node scripts/test-visible-stop.js`.
 Reload rescue не трогает ход, пока открыт SSE-поток ответа или Stop был виден за последние
 `CHAT_RESCUE_STOP_RECENT_SEC`: reload посреди extra_high обрывал генерацию (2.16.3).
+Поток закрылся без ответа, а conversation_id известен — вместо reload опрос conversation
+изнутри страницы до завершения ответа (2.16.4, `scripts/test-bg-poll.js`); ответ берётся
+только у текущего хода (`extractTurnAnswer`), reload — запасной путь при 401/403/404.
 Оверлей над композером снимается `dismissBlockingOverlay` (Escape, затем только кнопка
 закрытия); браузерная проверка: `node scripts/test-composer-overlay.js`.
 
