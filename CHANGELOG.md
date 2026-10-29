@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.16.6 — 2026-10-29
+
+- Image uploads failed: chatgpt.com dropped the `#upload-camera` id from the camera input
+  (`capture="environment"`, "Take a photo"), which comes first in DOM order, so the file
+  input selector resolved to it and uploads never turned into attachments. Every branch
+  of the selector now excludes inputs with `capture`.
+
 ## 2.16.5 — 2026-10-29
 
 - Diagnostics only: when the background poll reads a turn it cannot take an answer from,
