@@ -10,7 +10,7 @@ const {
 } = require('./cloudflare');
 const { solveTurnstile } = require('./turnstile');
 const {
-  COMPOSER_VISIBLE_SEL, SYSTEM_HINT_SEL, SEND_BUTTON_SEL, FILE_INPUT_SEL, ATTACHMENT_REMOVE_SEL,
+  COMPOSER_SEL, COMPOSER_VISIBLE_SEL, SYSTEM_HINT_SEL, SEND_BUTTON_SEL, FILE_INPUT_SEL, ATTACHMENT_REMOVE_SEL,
   TIER_TRIGGER_SEL, TIER_TRIGGER_VISIBLE_SEL, TIER_CAPTION_RE, stripTierCaption, readComposerText,
 } = require('./composer-dom');
 const { SseAccumulator, parseSseBody, extractAssistantFromMapping, isValidConversationId } = require('./lib/conversation-read');
@@ -109,6 +109,13 @@ const STALL_SNAPSHOT_KEEP = safePositiveInt(process.env.STALL_SNAPSHOT_KEEP, 20)
 // и извлекается обычным путём. Окно меньше stall-abort (120с), чтобы rescue успел
 // отработать до объявления сессии деградировавшей.
 const CHAT_STREAM_RESCUE_MS = safePositiveInt(process.env.CHAT_STREAM_RESCUE_SEC, 60) * 1000;
+// A Stop button seen this recently still means "generating" to the rescue gate. One probe
+// per poll can miss it (2026-10-29: the control was absent on the screenshot and present in
+// the HTML saved a moment later), and a reload during an extra_high run cuts the generation:
+// the reloaded page shows only the reasoning line, no Stop, and the turn stalls into a 504.
+const RESCUE_STOP_RECENT_MS = safePositiveInt(process.env.CHAT_RESCUE_STOP_RECENT_SEC, 30) * 1000;
+// Top reasoning tiers can think for minutes with the visible text unchanged.
+const HEAVY_THINKING_MODES = new Set(['extra_high', 'pro']);
 
 // ==== Session validity checking (see probeSessionState / the watchdog below) ====
 // /api/auth/session is authoritative but occasionally hiccups; one 4 s shot used to fall
@@ -344,10 +351,24 @@ function onBackendResponse(slot, p, response) {
       // headers arrive (inside the right turn), but text() resolves only when the
       // stream ends — by then a NEW turn's capture may be current. Merging into the
       // snapshot keeps a late body from bleeding into the wrong turn (Codex P1).
-      const body = await response.text().catch(() => null);
+      // The event fires when headers arrive and text() resolves only when the stream ends,
+      // so the stream is "open" in between: the server is still generating this turn. A
+      // reload in that window cuts a live generation (2026-10-29, extra_high runs).
+      // Counted, not flagged: closing one of two overlapping streams must not clear the other.
+      cap.openStreams = (cap.openStreams || 0) + 1;
+      let body = null;
+      try {
+        body = await response.text().catch(() => null);
+      } finally {
+        cap.openStreams--;
+      }
       if (p === slot.page && body) cap.merge(parseSseBody(body));
     }
   })().catch(() => {});
+}
+
+function streamOpen(capture) {
+  return !!(capture && capture.openStreams > 0);
 }
 
 function throwBackendPostFailure(capture, onSubmitted = null) {
@@ -515,6 +536,9 @@ function acceptSseChunk(slot, streamId, chunk) {
     cap.boundStream = streamId;
   }
   if (cap.boundStream !== streamId) return;
+  // Any chunk of THIS turn's stream is live server activity, reasoning events included —
+  // they carry no answer text, but they prove the turn is not stuck.
+  cap.lastChunkAt = Date.now();
   try { cap.feed(chunk); } catch {}
 }
 
@@ -1541,6 +1565,7 @@ async function clearComposer(p) {
   const count = await textareaLocator.count();
   if (!count) return;
 
+  await dismissBlockingOverlay(p);
   await textareaLocator.first().click();
   await p.waitForTimeout(150);
   await p.keyboard.press(process.platform === 'darwin' ? 'Meta+a' : 'Control+a');
@@ -1692,13 +1717,25 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   // counts as progress. See CHAT_STALL_WINDOW_MS. Thinking modes get a doubled window —
   // long reasoning can legitimately keep the visible text static for a while, and cutting
   // a live extended run is worse than waiting one extra window on a stuck one.
-  const stallWindowMs = isThinking ? CHAT_STALL_WINDOW_MS * 2 : CHAT_STALL_WINDOW_MS;
+  // The top tiers (extra_high, pro) get three windows; with the default 120 s that is the
+  // whole base budget, so they end on the deadline rather than on the stall guard.
+  const stallWindowMs = HEAVY_THINKING_MODES.has(options.thinkingMode) ? CHAT_STALL_WINDOW_MS * 3
+    : isThinking ? CHAT_STALL_WINDOW_MS * 2 : CHAT_STALL_WINDOW_MS;
   let lastSnapshot = null;
   let lastProgressAt = start;
+  // When a visible Stop button was last seen by any probe of this turn (0 = never).
+  let lastStopSeenAt = 0;
+  const probeStop = async () => {
+    const btn = await p.$(STOP_BTN_SELECTOR).catch(() => null);
+    if (btn) lastStopSeenAt = Date.now();
+    return btn;
+  };
+  let lastChunkSeenAt = 0;
   // Stream-rescue: максимум один reload за turn (флаг взводится ТОЛЬКО при фактическом
   // reload — пропуск из-за URL не /c/ не сжигает попытку; result-ревью Codex+agy).
   let rescueAttempted = false;
   let rescueSkipLogged = false;
+  let rescueDeferLogged = false;
 
   // Backend-api capture (READ_VIA_BACKEND_API=1): preferred source when it delivers a
   // complete answer; DOM scraping below stays untouched as the fallback.
@@ -1712,6 +1749,12 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   while (true) {
     throwBackendPostFailure(capture);
     if (capture) {
+      // Raw SSE chunks of this turn (reasoning included) are live progress even while the
+      // answer text has not started yet.
+      if (capture.lastChunkAt && capture.lastChunkAt !== lastChunkSeenAt) {
+        lastChunkSeenAt = capture.lastChunkAt;
+        lastProgressAt = Date.now();
+      }
       const snap = capture.snapshot();
       if (snap.lastAssistantText.length !== lastBackendLen) {
         lastBackendLen = snap.lastAssistantText.length;
@@ -1809,7 +1852,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
         if (!capture) emitDelta(bestText);
       }
 
-      const stopBtn = await p.$(STOP_BTN_SELECTOR).catch(() => null);
+      const stopBtn = await probeStop();
       if (bestText && !stopBtn && stableSince && Date.now() - stableSince >= stableMs) {
         return { text: bestText, conversationId: conversationIdFromUrl(p.url()) };
       }
@@ -1822,12 +1865,23 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     //   - stop-button виден = живая генерация, НЕ релоадим (agy: reload оборвал бы её;
     //     в сломанном рендере stop-button отсутствует — проверено по stalled-снапшоту);
     //   - URL ещё не /c/<id> → reload дал бы пустой новый чат; попытку НЕ сжигаем.
+    //   - stop-button виден в любом опросе за RESCUE_STOP_RECENT_MS или SSE-поток хода ещё
+    //     открыт — сервер генерирует (2026-10-29: reload посреди extra_high → 504).
+    //     Поток закрылся без ответа — rescue снова разрешён.
     if (!bestText && !rescueAttempted
         && Date.now() - lastProgressAt >= CHAT_STREAM_RESCUE_MS
         && Date.now() - start >= CHAT_STREAM_RESCUE_MS) {
-      const generating = await p.$(STOP_BTN_SELECTOR).catch(() => null);
-      if (generating) {
+      const generating = await probeStop();
+      const stopRecent = lastStopSeenAt > 0 && Date.now() - lastStopSeenAt < RESCUE_STOP_RECENT_MS;
+      const streaming = streamOpen(capture);
+      if (generating || stopRecent || streaming) {
         // Живая генерация без прогресса текста — оставляем это stall-guard'у.
+        if (!rescueDeferLogged) {
+          rescueDeferLogged = true;
+          const why = streaming ? 'response stream still open'
+            : `Stop button seen ${Math.round((Date.now() - lastStopSeenAt) / 1000)}s ago`;
+          console.log(`[rescue] no rendered text for ${Math.round((Date.now() - lastProgressAt) / 1000)}s, but ${why} — reload deferred`);
+        }
       } else if (!/\/c\//.test(p.url())) {
         if (!rescueSkipLogged) {
           rescueSkipLogged = true;
@@ -1875,7 +1929,8 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       // (captureTextState may have returned null). If ChatGPT is still streaming/
       // thinking, grant one extra window instead of cutting an in-progress answer.
       if (!extended) {
-        const stillGenerating = await p.$(STOP_BTN_SELECTOR).catch(() => null);
+        // An open response stream is generation too: the Stop probe alone can miss it.
+        const stillGenerating = (await probeStop()) || streamOpen(capture);
         const progressedRecently = Date.now() - lastProgressAt < stallWindowMs;
         if (stillGenerating && progressedRecently) {
           extended = true;
@@ -1884,9 +1939,9 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
           continue;
         }
         if (stillGenerating) {
-          // Stop-button visible but the page hasn't changed in a long time — a stuck UI, not
-          // a live generation. Don't extend: fail fast and release the queue.
-          console.log(`[chat] stop-button visible but no page progress for ${Math.round((Date.now() - lastProgressAt) / 1000)}s — treating as stuck, not extending`);
+          // Stop-button visible (or the stream still open) but the page hasn't changed in a
+          // long time — a stuck UI, not a live generation. Don't extend: fail fast.
+          console.log(`[chat] still generating by UI/stream but no page progress for ${Math.round((Date.now() - lastProgressAt) / 1000)}s — treating as stuck, not extending`);
         }
       }
       break;
@@ -2749,6 +2804,86 @@ async function typeAndSubmit(p, text, preserveAttachments = false, onSubmitted =
   await p.waitForTimeout(2000);
 }
 
+// Browser-side probe: is the visible composer under a foreign element at the point a click
+// lands (its centre)? Playwright then fails with "<…> intercepts pointer events" for the
+// full 30 s click timeout. Returns { covered, by } — `by` is a short description for logs.
+function composerCoverProbe(sel) {
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+  };
+  const composer = Array.from(document.querySelectorAll(sel)).find(visible);
+  if (!composer) return { covered: false };
+  const r = composer.getBoundingClientRect();
+  const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (!top || composer === top || composer.contains(top)) return { covered: false };
+  const src = top.getAttribute && (top.getAttribute('src') || '');
+  const cls = typeof top.className === 'string' ? top.className : '';
+  const by = `${String(top.tagName || '').toLowerCase()}${cls ? '.' + cls.trim().split(/\s+/).slice(0, 3).join('.') : ''}${src ? ` src=${src.slice(0, 120)}` : ''}`;
+  return { covered: true, by };
+}
+
+// Browser-side: click a dismiss control of the overlay covering the composer. Only buttons
+// whose label says close/skip/later — never a call to action, which could change settings
+// (the 2026-10-28 promo advertised the thinking-effort control), and never a bare "OK",
+// which in a confirmation dialog means "do it".
+function clickOverlayDismiss(sel) {
+  const DISMISS_RE = /^(close|dismiss|skip|not now|maybe later|got it|no thanks|закрыть|пропустить|не сейчас|позже|понятно|нет, спасибо)$/i;
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+  };
+  const composer = Array.from(document.querySelectorAll(sel)).find(visible);
+  if (!composer) return false;
+  const r = composer.getBoundingClientRect();
+  const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  if (!top || composer === top || composer.contains(top)) return false;
+  // Search the overlay that holds the covering element: its dialog, else its outermost
+  // ancestor that does not also contain the composer.
+  let scope = top.closest && top.closest('[role="dialog"], [role="alertdialog"]');
+  if (!scope) {
+    scope = top;
+    while (scope.parentElement && !scope.parentElement.contains(composer)) scope = scope.parentElement;
+  }
+  const label = (b) => (b.getAttribute('aria-label') || b.innerText || b.textContent || '')
+    .replace(/\s+/g, ' ').trim();
+  const btn = Array.from(scope.querySelectorAll('button, [role="button"]'))
+    .find((b) => visible(b) && (DISMISS_RE.test(label(b)) || b.getAttribute('data-testid') === 'close-button'));
+  if (!btn) return false;
+  btn.click();
+  return true;
+}
+
+// A promo/onboarding dialog can cover the composer after a fresh page or a hard reset
+// (2026-10-28: "chat-work-merge/thinking-effort-international" beacon intercepted every
+// click on the editor → 504). Escape first, then the overlay's own dismiss button. Never
+// throws; returns true when the composer ended up uncovered after a dismissal.
+async function dismissBlockingOverlay(p) {
+  const probe = () => p.evaluate(composerCoverProbe, COMPOSER_SEL).catch(() => null);
+  const first = await probe();
+  if (!first || !first.covered) return false;
+  console.log(`[ui-adapter] composer covered by ${first.by} — dismissing overlay`);
+  try {
+    await p.keyboard.press('Escape');
+    await p.waitForTimeout(400);
+    let now = await probe();
+    if (now && !now.covered) {
+      console.log('[ui-adapter] overlay dismissed (Escape)');
+      return true;
+    }
+    if (await p.evaluate(clickOverlayDismiss, COMPOSER_SEL).catch(() => false)) {
+      await p.waitForTimeout(400);
+      now = await probe();
+      if (now && !now.covered) {
+        console.log('[ui-adapter] overlay dismissed (close button)');
+        return true;
+      }
+    }
+    console.log(`[ui-adapter] composer still covered by ${(now && now.by) || first.by}`);
+  } catch {}
+  return false;
+}
+
 async function dismissModals(p) {
   await p.evaluate(() => {
     const modalIds = [
@@ -2765,6 +2900,7 @@ async function dismissModals(p) {
       '[data-testid="modal-fanny-pack"]',
     ].join(',')).forEach(el => el.remove());
   });
+  await dismissBlockingOverlay(p);
 }
 
 // ==== Image 2.0 UI capability adapter (toggles in composer toolbar) ====
@@ -4498,6 +4634,10 @@ module.exports = {
     menuFailures: () => getSlot(0).menuFailures,
     resetMenuFailures: () => { getSlot(0).menuFailures = 0; },
     acceptSseChunk,
+    composerCoverProbe,
+    clickOverlayDismiss,
+    dismissBlockingOverlay,
+    dismissModals,
     noteConversation: rememberConversation,
     bindPage,
     markHealthyCompletion,

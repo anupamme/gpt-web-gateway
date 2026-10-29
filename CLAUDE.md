@@ -88,6 +88,10 @@ git diff --cached | grep -nEi \
 может сохранять собственный composer. Проверка видимости должна применяться
 к каждому варианту селектора, иначе она блокирует завершение и reload rescue.
 Изолированная браузерная регрессия: `node scripts/test-visible-stop.js`.
+Reload rescue не трогает ход, пока открыт SSE-поток ответа или Stop был виден за последние
+`CHAT_RESCUE_STOP_RECENT_SEC`: reload посреди extra_high обрывал генерацию (2.16.3).
+Оверлей над композером снимается `dismissBlockingOverlay` (Escape, затем только кнопка
+закрытия); браузерная проверка: `node scripts/test-composer-overlay.js`.
 
 Helm-чарт лежит здесь (`helm/`), а его values и ArgoCD Application — в приватном
 deploy-репозитории, вне этого проекта. Релиз: бамп `version`/`appVersion` в

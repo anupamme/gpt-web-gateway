@@ -292,8 +292,9 @@ Every endpoint returns a uniform error shape:
 | `TIER_FALLBACK_PRO` | Tier used when `thinking_mode=pro` cannot be applied. `off`/`none`/empty disables the downgrade | `extra_high` |
 | `TIER_UNAVAILABLE_COOLDOWN_SEC` | How long a tier proven unavailable is skipped outright. Cleared early on a successful selection. `0` = re-probe every request | `900` |
 | `CHAT_COMPLETION_RETRY_TIMEOUT_SEC` | One-time adaptive extension for text, granted only while the model is visibly streaming/thinking. Cluster runs **180** | `120` |
-| `CHAT_STALL_WINDOW_SEC` | Stuck-guard: extensions require page/text change within the last N s (×2 for thinking modes). A frozen page with a stop button is not "live" | `120` |
-| `CHAT_STREAM_RESCUE_SEC` | Grace window to rescue a response that is still streaming at the deadline | `60` |
+| `CHAT_STALL_WINDOW_SEC` | Stuck-guard: extensions require page/text change or a response-stream chunk within the last N s (×2 for thinking modes, ×3 for `extra_high`/`pro`). A frozen page with a stop button is not "live" | `120` |
+| `CHAT_STREAM_RESCUE_SEC` | No rendered text for this long → one page reload to fetch a finished answer. Deferred while the response stream is open or a Stop button was seen recently | `60` |
+| `CHAT_RESCUE_STOP_RECENT_SEC` | A Stop button seen within this many seconds still blocks the reload rescue | `30` |
 | `CHATGPT_TEXT_RETRY_ATTEMPTS` | Attempts for `page_load_failed` transients (fresh page → full browser rebuild) | `4` |
 | `TEXT_STALL_RETRIES` | Extra fresh-page resends per text job after a stall with no answer, bound stream, POST failure or accepted POST. Only new conversations before any client delta; budget survives maintenance. Requires backend capture. `0` disables. Each resend obeys slot pacing; a lost POST response can still cause duplicate generation | `1` |
 | `PAGE_RECYCLE_AFTER_JOBS` | Recreate a slot's page on the next job after this many completed jobs on that page. Does not enter recovery probation. `0` disables | `50` |
