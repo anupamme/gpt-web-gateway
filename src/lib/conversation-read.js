@@ -125,6 +125,30 @@ function extractTurnAnswer(data, { notBeforeSec = 0 } = {}) {
   return { conversationId, turnFound: false, lastAssistantText: '', isComplete: false };
 }
 
+// Compact, content-free description of the active branch from current_node back to the
+// latest user message (newest first) — for diagnosing a turn the poll cannot read.
+function describeTurn(data) {
+  const mapping = data && data.mapping;
+  if (!mapping || typeof mapping !== 'object') return '';
+  const out = [];
+  const seen = new Set();
+  let id = data.current_node;
+  while (id && mapping[id] && !seen.has(id) && out.length < 12) {
+    seen.add(id);
+    const node = mapping[id];
+    const m = node && node.message;
+    if (m) {
+      const c = m.content || {};
+      const parts = Array.isArray(c.parts) ? c.parts.map(x => (typeof x === 'string' ? 's' : x && typeof x === 'object' ? (x.content_type || 'o') : typeof x)).join('+') : '-';
+      out.push([m.author && m.author.role, c.content_type, m.channel || '-', m.recipient || '-', m.status || '-',
+        `end=${m.end_turn === true ? 1 : 0}`, `parts=${parts}`, `len=${messageText(m).length}`].join('/'));
+      if (m.author && m.author.role === 'user') break;
+    }
+    id = node.parent;
+  }
+  return out.join(' < ');
+}
+
 // Incremental SSE accumulator. feed() raw chunk text as it arrives (chunks may split
 // lines/events arbitrarily); snapshot() at any time.
 class SseAccumulator {
@@ -305,6 +329,7 @@ module.exports = {
   isValidConversationId,
   extractAssistantFromMapping,
   extractTurnAnswer,
+  describeTurn,
   SseAccumulator,
   parseSseBody,
   parseConversationPayload,

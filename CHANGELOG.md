@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.16.5 — 2026-10-29
+
+- Diagnostics only: when the background poll reads a turn it cannot take an answer from,
+  the `[bg-poll]` line now lists the shape of each message on the active branch back to
+  the prompt (role, content type, channel, recipient, status, part types, text length),
+  never its content. 2.16.4 in production found the turn (`stream_status` COMPLETE, last
+  message `finished_successfully`) but no final text message in it.
+
 ## 2.16.4 — 2026-10-29
 
 2.16.3 did not close the 504s on heavy text turns. On `extra_high` (and sometimes `high`

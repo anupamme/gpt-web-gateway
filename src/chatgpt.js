@@ -13,7 +13,7 @@ const {
   COMPOSER_SEL, COMPOSER_VISIBLE_SEL, SYSTEM_HINT_SEL, SEND_BUTTON_SEL, FILE_INPUT_SEL, ATTACHMENT_REMOVE_SEL,
   TIER_TRIGGER_SEL, TIER_TRIGGER_VISIBLE_SEL, TIER_CAPTION_RE, stripTierCaption, readComposerText,
 } = require('./composer-dom');
-const { SseAccumulator, parseSseBody, extractAssistantFromMapping, extractTurnAnswer, isValidConversationId } = require('./lib/conversation-read');
+const { SseAccumulator, parseSseBody, extractAssistantFromMapping, extractTurnAnswer, describeTurn, isValidConversationId } = require('./lib/conversation-read');
 const { trimConversationData } = require('./lib/conversation-trim');
 // Liveness heartbeat for /health/live — named `liveness` to avoid clashing with the
 // local `progress` indicator object inside waitAndExtractImage.
@@ -1785,7 +1785,8 @@ async function pollConversation(p, conversationId, notBeforeSec) {
   }
   const snap = extractTurnAnswer(res.data, { notBeforeSec });
   if (!snap) return { kind: 'unsupported', detail: `unparsable conversation from ${res.path}` };
-  return { kind: 'ok', snap, path: res.path, streamStatus: res.streamStatus || null };
+  return { kind: 'ok', snap, path: res.path, streamStatus: res.streamStatus || null,
+    shape: snap.isComplete ? '' : describeTurn(res.data) };
 }
 
 function backgroundPollBudgetMs(thinkingMode, inputMs) {
@@ -1989,7 +1990,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
         bgPoll.errors = 0;
         liveness.touch(slotOf(p).jobId);
         const snap = r.snap;
-        const view = `turn=${snap.turnFound ? 'yes' : 'no'} chars=${snap.lastAssistantText.length} complete=${snap.isComplete} stream_status=${r.streamStatus || 'n/a'}`;
+        const view = `turn=${snap.turnFound ? 'yes' : 'no'} chars=${snap.lastAssistantText.length} complete=${snap.isComplete} stream_status=${r.streamStatus || 'n/a'}${r.shape ? ` branch=${r.shape}` : ''}`;
         if (view !== bgPoll.lastView) {
           bgPoll.lastView = view;
           console.log(`[bg-poll] #${bgPoll.polls} ${r.path}: ${view}`);

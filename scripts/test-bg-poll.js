@@ -303,3 +303,11 @@ test('pollConversation classifies refusal, transient failure and a missing page 
   assert.equal(r.kind, 'ok');
   assert.deepEqual(r.snap, { conversationId: CONVERSATION, turnFound: true, lastAssistantText: 'z', isComplete: true });
 });
+
+test('an unreadable turn is logged by shape, never by content', async () => {
+  const chat = require('../src/chatgpt');
+  const data = conversation({ answer: 'secret words', complete: false });
+  const r = await chat._test.pollConversation({ evaluate: async () => ok(data) }, CONVERSATION, NOW / 1000 - 2);
+  assert.equal(r.shape, 'assistant/text/-/-/in_progress/end=0/parts=s/len=12 < user/text/-/-/finished_successfully/end=0/parts=s/len=12');
+  assert.ok(!r.shape.includes('secret'));
+});
