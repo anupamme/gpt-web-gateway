@@ -40,10 +40,15 @@ const SEND_BUTTON_SEL = [
   'button[aria-label^="Отправить"]',
 ].join(', ');
 
+// The camera input ("Take a photo", capture="environment") also accepts image/* and sits
+// before the photos input in DOM order; since 2026-10-29 it lost its #upload-camera id, so
+// every branch excludes it by the `capture` attribute, not by id. Uploads sent there
+// never become attachment chips.
+const NOT_CAMERA = ':not(#upload-camera):not([capture])';
 const FILE_INPUT_SEL = [
   '#upload-photos',
-  'form[data-chatgpt-composer] input[type="file"][accept*="image"]',
-  'input[type="file"]:not(#upload-camera)',
+  `form[data-chatgpt-composer] input[type="file"][accept*="image"]${NOT_CAMERA}`,
+  `input[type="file"]${NOT_CAMERA}`,
 ].join(', ');
 
 // One "Remove …" button per pending attachment. A single querySelectorAll over the union

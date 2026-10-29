@@ -31,6 +31,15 @@ async function test(name, fn) { await fn(); console.log(`PASS: ${name}`); passed
     assert.ok(dom.ATTACHMENT_REMOVE_SEL.includes('[data-composer-attachments] button[aria-label^="Remove"]'));
   });
 
+  await test('file input never resolves to the camera input', async () => {
+    // 29.10.2026: the camera input lost #upload-camera; `.first()` picked
+    // <input accept="image/*" capture="environment" aria-label="Take a photo"> and uploads failed.
+    for (const s of dom.FILE_INPUT_SEL.split(', ')) {
+      if (s === '#upload-photos') continue;
+      assert.ok(s.includes(':not([capture])'), `camera not excluded in ${s}`);
+    }
+  });
+
   await test('stripTierCaption drops the trigger caption but keeps the level', async () => {
     assert.strictEqual(dom.stripTierCaption('Thinking effort\n Medium'), 'Medium');
     assert.strictEqual(dom.stripTierCaption('Medium'), 'Medium');
