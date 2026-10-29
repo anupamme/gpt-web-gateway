@@ -132,8 +132,15 @@ const BG_POLL_FETCH_TIMEOUT_MS = 10000;
 const BG_POLL_MAX_ERRORS = 3;
 // Classic path first (known payload shape); the app itself now loads `/conversations/{id}`.
 const BG_POLL_PATHS = ['/backend-api/conversation/{id}', '/backend-api/conversations/{id}'];
-// Server clock vs ours: a user message older than submit minus this is a previous turn.
-const BG_POLL_TURN_SLACK_SEC = 120;
+// A user message created before this turn's capture opened (minus clock skew) belongs to a
+// previous turn. The capture opens before the prompt is typed, the previous turn finished
+// before it, so only skew can blur the line. Without a capture: submit minus 120 s.
+const BG_POLL_CLOCK_SKEW_SEC = 2;
+const BG_POLL_NO_CAPTURE_SLACK_SEC = 120;
+function turnNotBeforeSec(capture, startMs) {
+  if (capture && capture.startedAt) return Math.floor(capture.startedAt / 1000) - BG_POLL_CLOCK_SKEW_SEC;
+  return Math.floor(startMs / 1000) - BG_POLL_NO_CAPTURE_SLACK_SEC;
+}
 
 // ==== Session validity checking (see probeSessionState / the watchdog below) ====
 // /api/auth/session is authoritative but occasionally hiccups; one 4 s shot used to fall
@@ -337,7 +344,11 @@ function onBackendResponse(slot, p, response) {
           || nodes.filter(node => node.message).at(-1)?.message;
         console.log(`[backend-read] slot=${slot.id} conversation GET status=${status} messages=${nodes.length} last_role=${last?.author?.role || 'none'} last_status=${last?.status || 'none'}`);
       }
-      const snap = data ? extractAssistantFromMapping(data) : null;
+      // Inside a turn, only that turn's answer counts: the background poll's own GETs land
+      // here too, and on a continuation the tree still holds the previous reply.
+      const snap = !data ? null
+        : cap ? extractTurnAnswer(data, { notBeforeSec: turnNotBeforeSec(cap) })
+          : extractAssistantFromMapping(data);
       if (snap && snap.lastAssistantText) {
         rememberConversation(slot, snap);
       }
@@ -1754,7 +1765,7 @@ async function conversationPollInPage({ id, paths, timeoutMs }) {
 // One poll → { kind: 'ok', snap, path, streamStatus } | { kind: 'unsupported', detail }
 // (the endpoint refuses or answers an unknown shape: fall back to reload) |
 // { kind: 'error', detail } (transient: retry on the next interval).
-async function pollConversation(p, conversationId, turnStartMs) {
+async function pollConversation(p, conversationId, notBeforeSec) {
   let timer;
   let res;
   try {
@@ -1772,7 +1783,7 @@ async function pollConversation(p, conversationId, turnStartMs) {
     const refused = tried.length > 0 && tried.every(t => t.shape !== undefined || [401, 403, 404].includes(t.status));
     return { kind: refused ? 'unsupported' : 'error', detail };
   }
-  const snap = extractTurnAnswer(res.data, { notBeforeSec: Math.floor(turnStartMs / 1000) - BG_POLL_TURN_SLACK_SEC });
+  const snap = extractTurnAnswer(res.data, { notBeforeSec });
   if (!snap) return { kind: 'unsupported', detail: `unparsable conversation from ${res.path}` };
   return { kind: 'ok', snap, path: res.path, streamStatus: res.streamStatus || null };
 }
@@ -1973,7 +1984,7 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     if (bgPoll && Date.now() >= bgPoll.nextAt) {
       bgPoll.nextAt = Date.now() + BG_POLL_INTERVAL_MS;
       bgPoll.polls++;
-      const r = await pollConversation(p, bgPoll.id, start);
+      const r = await pollConversation(p, bgPoll.id, turnNotBeforeSec(capture, start));
       if (r.kind === 'ok') {
         bgPoll.errors = 0;
         liveness.touch(slotOf(p).jobId);
@@ -1983,8 +1994,9 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
           bgPoll.lastView = view;
           console.log(`[bg-poll] #${bgPoll.polls} ${r.path}: ${view}`);
         }
-        if (snap.isComplete && snap.lastAssistantText
-            && snap.lastAssistantText !== (beforeState.lastAssistantText || '')) {
+        // No comparison with the previous text: the turn is identified structurally, and a
+        // repeated short answer ("Yes") is still this turn's answer.
+        if (snap.isComplete && snap.lastAssistantText) {
           console.log(`[bg-poll] answer taken from conversation poll (${snap.lastAssistantText.length} chars, ${Math.round((Date.now() - start) / 1000)}s after submit)`);
           emitDelta(snap.lastAssistantText);
           return { text: snap.lastAssistantText, conversationId: snap.conversationId || bgPoll.id };

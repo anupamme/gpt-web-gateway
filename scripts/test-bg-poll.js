@@ -4,7 +4,7 @@
 // browser, clock and the page's fetch are replaced.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { fixture, logs, CONVERSATION } = require('./test-stall-diagnostics');
+const { fixture, logs, response, CONVERSATION } = require('./test-stall-diagnostics');
 
 const empty = () => ({ assistantCount: 0, lastAssistantText: '', bodyTail: '' });
 const NOW = 1_800_000_000_000;
@@ -66,6 +66,8 @@ test('a closed stream is answered from the conversation poll, without a reload',
     assert.equal(p.pollTimes.length, 3);
     assert.deepEqual(p.pollTimes.slice(1).map((t, i) => t - p.pollTimes[i]), [15000, 15000], 'one poll per interval');
     assert.equal(p.pollArgs[0].id, CONVERSATION);
+    assert.deepEqual(p.pollArgs[0].paths, ['/backend-api/conversation/{id}', '/backend-api/conversations/{id}'],
+      'the classic path (known payload shape) is tried first');
     assert.deepEqual(deltas, ['full answer'], 'only the finished text reaches the client');
     assert.doesNotMatch(output, /session degraded/);
     assert.match(output, /\[bg-poll\] answer taken from conversation poll \(11 chars/);
@@ -101,6 +103,37 @@ test('a user message older than this turn does not count as the prompt', async (
     const { p, capture } = await setup(chat, page, queue, clock, [ok(old)]);
     await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture }), e => e.code === 'timeout'));
     assert.ok(p.pollTimes.length > 1);
+  });
+});
+
+test('a previous turn seconds before this capture is still a previous turn', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const prev = conversation({ answer: 'previous', complete: true, promptAt: NOW / 1000 - 10 });
+    const { p, capture } = await setup(chat, page, queue, clock, [ok(prev)]);
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'instant' }),
+      e => e.code === 'timeout'));
+  });
+});
+
+test('the poll GET seen by the passive listener cannot smuggle in the previous reply', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const prev = conversation({ withPrompt: false });
+    prev.mapping.a0.message.content.parts = ['**old** answer'];
+    const { p, capture } = await setup(chat, page, queue, clock, [() => {
+      p.emit('response', response({ method: 'GET', url: `/backend-api/conversation/${CONVERSATION}`, ct: 'application/json', data: prev }));
+      return ok(prev);
+    }]);
+    const before = { ...empty(), lastAssistantText: 'old answer' };
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, before, { capture, thinkingMode: 'instant' }),
+      e => e.code === 'timeout'));
+  });
+});
+
+test('an answer identical to the previous one is still returned', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [ok(conversation({ answer: 'Yes', complete: true }))]);
+    const { result } = await logs(() => chat._test.waitAndExtractText(p, { ...empty(), lastAssistantText: 'Yes' }, { capture }));
+    assert.equal(result.text, 'Yes');
   });
 });
 
@@ -152,6 +185,24 @@ test('one transient error does not stop the poll', async () => {
     const { result } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture }));
     assert.equal(result.text, 'done');
     assert.deepEqual(p.actions.filter(a => a === 'reload'), []);
+  });
+});
+
+test('a successful poll resets the transient error count', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [new Error('net'), ok(conversation()),
+      new Error('net'), new Error('net'), ok(conversation({ answer: 'after hiccups', complete: true }))]);
+    const { result } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }));
+    assert.equal(result.text, 'after hiccups');
+    assert.deepEqual(p.actions.filter(a => a === 'reload'), []);
+  });
+});
+
+test('slow prompt input comes out of the poll budget, never below two rescue windows', async () => {
+  await fixture(ENV, async ({ chat }) => {
+    assert.equal(chat._test.backgroundPollBudgetMs('extra_high', 0), 120000);
+    assert.equal(chat._test.backgroundPollBudgetMs('extra_high', 30000 + 50000), 70000);
+    assert.equal(chat._test.backgroundPollBudgetMs('instant', 30000 + 1000000), 2000);
   });
 });
 
@@ -240,7 +291,7 @@ test('in-page poll: refusals and unknown shapes are reported, not thrown', async
 test('pollConversation classifies refusal, transient failure and a missing page result', async () => {
   const chat = require('../src/chatgpt');
   const pageWith = result => ({ evaluate: async () => (result instanceof Error ? Promise.reject(result) : result) });
-  const kind = async r => (await chat._test.pollConversation(pageWith(r), CONVERSATION, NOW)).kind;
+  const kind = async r => (await chat._test.pollConversation(pageWith(r), CONVERSATION, NOW / 1000 - 2)).kind;
   assert.equal(await kind({ ok: false, tried: [{ status: 403 }, { status: 404 }] }), 'unsupported');
   assert.equal(await kind({ ok: false, tried: [{ status: 404 }, { status: 500 }] }), 'error');
   assert.equal(await kind({ ok: false, tried: [{ error: 'aborted' }] }), 'error');
@@ -248,7 +299,7 @@ test('pollConversation classifies refusal, transient failure and a missing page 
   assert.equal(await kind(new Error('closed')), 'error');
   assert.equal(await kind(undefined), 'unsupported');
   assert.equal(await kind(ok({ mapping: {} })), 'unsupported');
-  const r = await chat._test.pollConversation(pageWith(ok(conversation({ answer: 'z', complete: true }))), CONVERSATION, NOW);
+  const r = await chat._test.pollConversation(pageWith(ok(conversation({ answer: 'z', complete: true }))), CONVERSATION, NOW / 1000 - 2);
   assert.equal(r.kind, 'ok');
   assert.deepEqual(r.snap, { conversationId: CONVERSATION, turnFound: true, lastAssistantText: 'z', isComplete: true });
 });

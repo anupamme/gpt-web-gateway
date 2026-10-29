@@ -275,7 +275,9 @@ test('GET diagnostics include mapping size and current message metadata, with st
     const p = page(); queue.push(p); const slot = chat.getSlot(1); await chat.getPage(slot);
     chat._test.beginBackendCapture(slot);
     const data = { conversation_id: CONVERSATION, current_node: 'last', mapping: {
-      last: { message: { author: { role: 'assistant' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['answer'] } } },
+      last: { parent: 'prompt', message: { author: { role: 'assistant' }, status: 'finished_successfully', content: { content_type: 'text', parts: ['answer'] } } },
+      // Inside a turn only an answer under this turn's prompt is remembered (2.16.4).
+      prompt: { parent: 'root', message: { author: { role: 'user' }, create_time: 2e9, content: { content_type: 'text', parts: ['q'] } } },
       root: { message: null },
     } };
     const { output } = await logs(async () => {
@@ -284,7 +286,7 @@ test('GET diagnostics include mapping size and current message metadata, with st
       p.emit('response', response({ method: 'GET', url: `/backend-api/conversation/${CONVERSATION}`, status: 403 }));
       await flush();
     });
-    assert.match(output, /slot=1 conversation GET status=200 messages=2 last_role=assistant last_status=finished_successfully/);
+    assert.match(output, /slot=1 conversation GET status=200 messages=3 last_role=assistant last_status=finished_successfully/);
     assert.match(output, /slot=1 conversation GET status=403\n/);
     assert.equal(slot.lastConversationFetch.lastAssistantText, 'answer');
   });
