@@ -261,7 +261,8 @@ test('backend ring is per slot, bounded, redacts ids and includes pre-wait respo
     assert.equal(slot.backendResponses.length, 30);
     assert.equal(chat.getSlot(0).backendResponses.length, 0);
     const diagnostics = output.split('\n').filter(line => line.includes('[stall-diag]'));
-    assert.equal(diagnostics.length, 2, 'both rescue and stall abort log the ring');
+    // The page double refuses the conversation poll, so the turn goes poll → reload → abort.
+    assert.equal(diagnostics.length, 3, 'poll start, rescue and stall abort log the ring');
     for (const line of diagnostics) {
       assert.match(line, /slot=1 backend-api since submit: GET \/backend-api\/files\/<id>\/<id> 200, POST \/backend-api\/f\/conversation 204/);
       assert.ok(!line.includes('/old/'));

@@ -86,6 +86,45 @@ function extractAssistantFromMapping(data) {
   return { conversationId: data.conversation_id || null, lastAssistantText: '', isComplete: false };
 }
 
+// Answer to the LATEST user turn of the active branch — for polling a conversation while
+// ChatGPT finishes it in the background. Unlike extractAssistantFromMapping, the walk from
+// current_node stops at the first user message: on a continuation the tree still holds the
+// previous reply, and returning it would answer this turn with the last one.
+// `notBeforeSec` (server epoch seconds) rejects a user message older than this turn — the
+// new prompt may not be on the active branch yet when the poll starts.
+//   → null for a payload without mapping/current_node (unknown shape);
+//   → { conversationId, turnFound, lastAssistantText, isComplete } otherwise.
+function extractTurnAnswer(data, { notBeforeSec = 0 } = {}) {
+  if (!data || typeof data !== 'object') return null;
+  const mapping = data.mapping;
+  if (!mapping || typeof mapping !== 'object' || !data.current_node) return null;
+  const conversationId = data.conversation_id || null;
+  const seen = new Set();
+  let id = data.current_node;
+  let answer = null;
+  while (id && mapping[id] && !seen.has(id)) {
+    seen.add(id);
+    const node = mapping[id];
+    const message = node && node.message;
+    if (message && message.author && message.author.role === 'user') {
+      const created = Number(message.create_time);
+      const ours = !notBeforeSec || !Number.isFinite(created) || created <= 0 || created >= notBeforeSec;
+      return {
+        conversationId,
+        turnFound: ours,
+        lastAssistantText: ours && answer ? answer.text : '',
+        isComplete: !!(ours && answer && answer.complete),
+      };
+    }
+    if (!answer && isFinalAssistantMessage(message)) {
+      const text = messageText(message).trim();
+      if (text) answer = { text, complete: isMessageComplete(message) };
+    }
+    id = node.parent;
+  }
+  return { conversationId, turnFound: false, lastAssistantText: '', isComplete: false };
+}
+
 // Incremental SSE accumulator. feed() raw chunk text as it arrives (chunks may split
 // lines/events arbitrarily); snapshot() at any time.
 class SseAccumulator {
@@ -265,6 +304,7 @@ function parseConversationPayload(input) {
 module.exports = {
   isValidConversationId,
   extractAssistantFromMapping,
+  extractTurnAnswer,
   SseAccumulator,
   parseSseBody,
   parseConversationPayload,

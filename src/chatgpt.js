@@ -13,7 +13,7 @@ const {
   COMPOSER_SEL, COMPOSER_VISIBLE_SEL, SYSTEM_HINT_SEL, SEND_BUTTON_SEL, FILE_INPUT_SEL, ATTACHMENT_REMOVE_SEL,
   TIER_TRIGGER_SEL, TIER_TRIGGER_VISIBLE_SEL, TIER_CAPTION_RE, stripTierCaption, readComposerText,
 } = require('./composer-dom');
-const { SseAccumulator, parseSseBody, extractAssistantFromMapping, isValidConversationId } = require('./lib/conversation-read');
+const { SseAccumulator, parseSseBody, extractAssistantFromMapping, extractTurnAnswer, isValidConversationId } = require('./lib/conversation-read');
 const { trimConversationData } = require('./lib/conversation-trim');
 // Liveness heartbeat for /health/live — named `liveness` to avoid clashing with the
 // local `progress` indicator object inside waitAndExtractImage.
@@ -116,6 +116,24 @@ const CHAT_STREAM_RESCUE_MS = safePositiveInt(process.env.CHAT_STREAM_RESCUE_SEC
 const RESCUE_STOP_RECENT_MS = safePositiveInt(process.env.CHAT_RESCUE_STOP_RECENT_SEC, 30) * 1000;
 // Top reasoning tiers can think for minutes with the visible text unchanged.
 const HEAVY_THINKING_MODES = new Set(['extra_high', 'pro']);
+// Background-answer poll (2.16.4, 2026-10-29): on heavy prompts ChatGPT closes the SSE POST
+// before the first answer byte and finishes the turn server-side; the page never renders it
+// and a reload does not either (the turn then stalled into a 504). Instead of reloading, the
+// gateway reads the conversation from inside the page (its own cookies + access token) every
+// interval until the answer of THIS turn is complete. Budgets count from submit; reload stays
+// the fallback when the endpoint refuses (401/403/404) or keeps failing.
+const BG_POLL_INTERVAL_MS = safePositiveInt(process.env.CHAT_BG_POLL_INTERVAL_SEC, 15) * 1000;
+const BG_POLL_BUDGET_MS = {
+  heavy: safePositiveInt(process.env.CHAT_BG_POLL_HEAVY_SEC, 600) * 1000,
+  thinking: safePositiveInt(process.env.CHAT_BG_POLL_THINKING_SEC, 420) * 1000,
+  instant: safePositiveInt(process.env.CHAT_BG_POLL_SEC, 240) * 1000,
+};
+const BG_POLL_FETCH_TIMEOUT_MS = 10000;
+const BG_POLL_MAX_ERRORS = 3;
+// Classic path first (known payload shape); the app itself now loads `/conversations/{id}`.
+const BG_POLL_PATHS = ['/backend-api/conversation/{id}', '/backend-api/conversations/{id}'];
+// Server clock vs ours: a user message older than submit minus this is a previous turn.
+const BG_POLL_TURN_SLACK_SEC = 120;
 
 // ==== Session validity checking (see probeSessionState / the watchdog below) ====
 // /api/auth/session is authoritative but occasionally hiccups; one 4 s shot used to fall
@@ -1677,6 +1695,96 @@ async function captureTextState(p) {
   });
 }
 
+// Runs IN THE PAGE (self-contained): read the conversation with the page's own cookies and
+// access token — the same GETs the app makes itself. Returns only the active branch from
+// current_node up to the latest user message, so a long chat does not cross the bridge.
+async function conversationPollInPage({ id, paths, timeoutMs }) {
+  const get = async (url, headers) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(url, { headers, credentials: 'include', cache: 'no-store', signal: ctrl.signal });
+    } finally { clearTimeout(timer); }
+  };
+  let token = null;
+  try {
+    const r = await get('/api/auth/session', {});
+    if (r.ok) token = ((await r.json()) || {}).accessToken || null;
+  } catch {}
+  const headers = token ? { Authorization: 'Bearer ' + token } : {};
+  const tried = [];
+  for (const template of paths) {
+    const path = template.replace('{id}', id);
+    let r;
+    try {
+      r = await get(path, headers);
+    } catch (e) {
+      tried.push({ path: template, error: String((e && e.message) || e).slice(0, 120) });
+      continue;
+    }
+    if (!r.ok) { tried.push({ path: template, status: r.status }); continue; }
+    let data = null;
+    try { data = await r.json(); } catch {}
+    if (!data || typeof data !== 'object' || !data.mapping || typeof data.mapping !== 'object' || !data.current_node) {
+      tried.push({ path: template, status: r.status,
+        shape: data && typeof data === 'object' ? Object.keys(data).slice(0, 12).join(',') : typeof data });
+      continue;
+    }
+    const mapping = {};
+    const seen = new Set();
+    let nodeId = data.current_node;
+    while (nodeId && data.mapping[nodeId] && !seen.has(nodeId)) {
+      seen.add(nodeId);
+      const node = data.mapping[nodeId];
+      mapping[nodeId] = node;
+      if (node.message && node.message.author && node.message.author.role === 'user') break;
+      nodeId = node.parent;
+    }
+    let streamStatus = null;
+    try {
+      const st = await get(`/backend-api/conversation/${id}/stream_status`, headers);
+      streamStatus = `${st.status} ${(await st.text()).replace(/\s+/g, ' ').slice(0, 160)}`;
+    } catch {}
+    return { ok: true, path: template, token: !!token, streamStatus,
+      data: { conversation_id: data.conversation_id || id, current_node: data.current_node, mapping } };
+  }
+  return { ok: false, token: !!token, tried };
+}
+
+// One poll → { kind: 'ok', snap, path, streamStatus } | { kind: 'unsupported', detail }
+// (the endpoint refuses or answers an unknown shape: fall back to reload) |
+// { kind: 'error', detail } (transient: retry on the next interval).
+async function pollConversation(p, conversationId, turnStartMs) {
+  let timer;
+  let res;
+  try {
+    res = await Promise.race([
+      p.evaluate(conversationPollInPage, { id: conversationId, paths: BG_POLL_PATHS, timeoutMs: BG_POLL_FETCH_TIMEOUT_MS }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('poll deadline')), BG_POLL_FETCH_TIMEOUT_MS * 4); }),
+    ]);
+  } catch (e) {
+    return { kind: 'error', detail: String((e && e.message) || e).slice(0, 160) };
+  } finally { clearTimeout(timer); }
+  if (!res || typeof res !== 'object') return { kind: 'unsupported', detail: 'no result from the page' };
+  if (!res.ok) {
+    const tried = Array.isArray(res.tried) ? res.tried : [];
+    const detail = `token=${res.token ? 'yes' : 'no'} ${JSON.stringify(tried)}`;
+    const refused = tried.length > 0 && tried.every(t => t.shape !== undefined || [401, 403, 404].includes(t.status));
+    return { kind: refused ? 'unsupported' : 'error', detail };
+  }
+  const snap = extractTurnAnswer(res.data, { notBeforeSec: Math.floor(turnStartMs / 1000) - BG_POLL_TURN_SLACK_SEC });
+  if (!snap) return { kind: 'unsupported', detail: `unparsable conversation from ${res.path}` };
+  return { kind: 'ok', snap, path: res.path, streamStatus: res.streamStatus || null };
+}
+
+function backgroundPollBudgetMs(thinkingMode, inputMs) {
+  const base = HEAVY_THINKING_MODES.has(thinkingMode) ? BG_POLL_BUDGET_MS.heavy
+    : thinkingMode && thinkingMode !== 'instant' ? BG_POLL_BUDGET_MS.thinking : BG_POLL_BUDGET_MS.instant;
+  // Same slow-input discount as the base response window: the request already spent it.
+  const overrun = CHAT_COMPLETION_TIMEOUT_MS - responseBaseBudgetMs(inputMs);
+  return Math.max(base - overrun, CHAT_STREAM_RESCUE_MS * 2);
+}
+
 // Placeholder text ChatGPT shows in the assistant message bubble WHILE reasoning
 // is still in progress (the collapsible "Thinking" block before the actual answer
 // is streamed in). If the extractor grabs this and returns early, the caller sees
@@ -1736,6 +1844,10 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
   let rescueAttempted = false;
   let rescueSkipLogged = false;
   let rescueDeferLogged = false;
+  // Background-answer poll (see BG_POLL_*): engaged instead of the reload once the response
+  // stream has closed without an answer; reload stays the fallback when the poll is refused.
+  let bgPoll = null;
+  let bgPollUnsupported = false;
 
   // Backend-api capture (READ_VIA_BACKEND_API=1): preferred source when it delivers a
   // complete answer; DOM scraping below stays untouched as the fallback.
@@ -1858,6 +1970,37 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
       }
     }
 
+    if (bgPoll && Date.now() >= bgPoll.nextAt) {
+      bgPoll.nextAt = Date.now() + BG_POLL_INTERVAL_MS;
+      bgPoll.polls++;
+      const r = await pollConversation(p, bgPoll.id, start);
+      if (r.kind === 'ok') {
+        bgPoll.errors = 0;
+        liveness.touch(slotOf(p).jobId);
+        const snap = r.snap;
+        const view = `turn=${snap.turnFound ? 'yes' : 'no'} chars=${snap.lastAssistantText.length} complete=${snap.isComplete} stream_status=${r.streamStatus || 'n/a'}`;
+        if (view !== bgPoll.lastView) {
+          bgPoll.lastView = view;
+          console.log(`[bg-poll] #${bgPoll.polls} ${r.path}: ${view}`);
+        }
+        if (snap.isComplete && snap.lastAssistantText
+            && snap.lastAssistantText !== (beforeState.lastAssistantText || '')) {
+          console.log(`[bg-poll] answer taken from conversation poll (${snap.lastAssistantText.length} chars, ${Math.round((Date.now() - start) / 1000)}s after submit)`);
+          emitDelta(snap.lastAssistantText);
+          return { text: snap.lastAssistantText, conversationId: snap.conversationId || bgPoll.id };
+        }
+      } else {
+        if (r.kind === 'error') bgPoll.errors++;
+        console.log(`[bg-poll] #${bgPoll.polls} ${r.kind}: ${r.detail}`);
+        if (r.kind === 'unsupported' || bgPoll.errors >= BG_POLL_MAX_ERRORS) {
+          console.log('[bg-poll] conversation poll unavailable — falling back to the reload rescue');
+          bgPoll = null;
+          bgPollUnsupported = true;
+          continue;
+        }
+      }
+    }
+
     // Stream-rescue: сервер уже мог ответить, а стрим в headless не дорисовал текст
     // (2026-07-11, markdown-new-styling: пустой <p> в result-thinking, вечная точка).
     // Один reload — готовый ответ рендерится статически. Гейты против ложных срабатываний:
@@ -1868,7 +2011,9 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
     //   - stop-button виден в любом опросе за RESCUE_STOP_RECENT_MS или SSE-поток хода ещё
     //     открыт — сервер генерирует (2026-10-29: reload посреди extra_high → 504).
     //     Поток закрылся без ответа — rescue снова разрешён.
-    if (!bestText && !rescueAttempted
+    //   - поток закрыт, conversation_id известен → вместо reload опрос conversation изнутри
+    //     страницы (bgPoll, 2.16.4); reload — только если опрос отказан/не работает.
+    if (!bestText && !rescueAttempted && !bgPoll
         && Date.now() - lastProgressAt >= CHAT_STREAM_RESCUE_MS
         && Date.now() - start >= CHAT_STREAM_RESCUE_MS) {
       const generating = await probeStop();
@@ -1882,6 +2027,14 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
             : `Stop button seen ${Math.round((Date.now() - lastStopSeenAt) / 1000)}s ago`;
           console.log(`[rescue] no rendered text for ${Math.round((Date.now() - lastProgressAt) / 1000)}s, but ${why} — reload deferred`);
         }
+      } else if (!bgPollUnsupported && isValidConversationId(
+        conversationIdFromUrl(p.url()) || (capture && capture.snapshot().conversationId))) {
+        const id = conversationIdFromUrl(p.url()) || capture.snapshot().conversationId;
+        const budgetMs = backgroundPollBudgetMs(options.thinkingMode, options.inputMs);
+        bgPoll = { id, until: start + budgetMs, nextAt: Date.now(), errors: 0, polls: 0, lastView: null };
+        console.log(`[bg-poll] no rendered text for ${Math.round((Date.now() - lastProgressAt) / 1000)}s and the response stream is closed — polling the conversation every ${Math.round(BG_POLL_INTERVAL_MS / 1000)}s for up to ${Math.round(budgetMs / 1000)}s after submit instead of reloading`);
+        logStallBackend(slotOf(p), capture);
+        continue;
       } else if (!/\/c\//.test(p.url())) {
         if (!rescueSkipLogged) {
           rescueSkipLogged = true;
@@ -1904,6 +2057,19 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
         }
         continue;
       }
+    }
+
+    // While the poll runs, the poll budget replaces the stall guard and the deadline: the page
+    // is expected to stay still while ChatGPT finishes the turn server-side.
+    if (bgPoll) {
+      if (Date.now() >= bgPoll.until) {
+        await saveDebugSnapshot(p, 'text_stalled').catch(() => {});
+        const err = new Error(`ChatGPT did not finish the answer within ${Math.round((bgPoll.until - start) / 1000)}s after submit (background poll, ${bgPoll.polls} polls)`);
+        err.code = 'timeout';
+        throw err;
+      }
+      await p.waitForTimeout(1000);
+      continue;
     }
 
     // EARLY stall-abort (Codex plan-review 1.2.31): don't wait the full base budget on a
@@ -4634,6 +4800,9 @@ module.exports = {
     menuFailures: () => getSlot(0).menuFailures,
     resetMenuFailures: () => { getSlot(0).menuFailures = 0; },
     acceptSseChunk,
+    conversationPollInPage,
+    pollConversation,
+    backgroundPollBudgetMs,
     composerCoverProbe,
     clickOverlayDismiss,
     dismissBlockingOverlay,
