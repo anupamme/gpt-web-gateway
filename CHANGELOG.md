@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.16.3 — 2026-10-29
+
+Heavy `extra_high` text turns (22–56k-character prompts) failed with 504 "no progress
+for 240s". The reload rescue fired ~61 s after submit while ChatGPT was still thinking:
+a single Stop probe missed the button and the response stream was still open. The reload
+cut the generation; the new page showed only the reasoning line and stalled.
+
+- The reload rescue is deferred while the conversation response stream is open, or while
+  a Stop button was seen by any probe in the last `CHAT_RESCUE_STOP_RECENT_SEC` (default
+  30). Once the stream closes without an answer, the rescue works as before.
+- Any response-stream chunk of the turn, reasoning events included, counts as progress
+  for the stall guard. `extra_high` and `pro` get three stall windows (360 s by default,
+  the whole base budget) instead of two. An open stream at the deadline grants the usual
+  one extension. No prompt is ever resent by these changes.
+- A promo or onboarding overlay covering the composer (seen after a hard reset: a
+  thinking-effort beacon intercepted every click on the editor, 504 after 30 s) is
+  dismissed before the editor is clicked: Escape first, then the overlay's own
+  close/skip/"not now" button. Calls to action and bare "OK" are never clicked.
+- Tests: `scripts/test-rescue-gate.js` (in `npm test`) and an offline Chromium check
+  `node scripts/test-composer-overlay.js`.
+
 ## 2.16.2 — 2026-10-26
 
 - Rebuild on Node 24.22.1 to patch CVE-2026-111497 (out-of-bounds write in the
