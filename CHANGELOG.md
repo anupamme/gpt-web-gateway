@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.16.7 — 2026-10-30
+
+The 504s on heavy text turns were empty turns, not slow ones. In 15 of 15 production cases
+(12 h of 2.16.6 logs) the background poll found this turn with `stream_status` COMPLETE and
+a branch of reasoning only (`thoughts` finished < `thoughts` in_progress < prompt), no answer
+text anywhere in the conversation, and that branch never changed again over 17–33 polls;
+the request then waited out the whole 420/600 s budget and answered 504.
+
+- New error kind `empty_turn` (HTTP 502, `should_retry: true`, not an infra failure for the
+  health streak, own `gpt_web_gateway_errors_total` / duration series). It fires when this
+  turn has no answer text, `stream_status` is COMPLETE and the branch fingerprint is
+  identical for `CHAT_BG_POLL_EMPTY_POLLS` (3) polls in a row — about 90 s after the last
+  progress instead of 420–600 s. The fingerprint covers node ids, statuses, update times,
+  `end_turn`, child counts and a hash of each message's content, never the content itself:
+  a thought that grows or is rewritten, a new node or a status flip restarts the count, and
+  only polls that look empty (this turn, no text, COMPLETE) count at all.
+- Reasoning (`thoughts`, `reasoning_recap`) and non-final channels are never taken as the
+  answer; the final text is taken after reasoning whether it is marked complete by status,
+  `end_turn` or `metadata.is_complete`. Tests pin these forms.
+- The `[bg-poll]` branch diagnostics add the number of thoughts per reasoning message (`th=N`).
+
 ## 2.16.6 — 2026-10-29
 
 - Image uploads failed: chatgpt.com dropped the `#upload-camera` id from the camera input
