@@ -311,3 +311,133 @@ test('an unreadable turn is logged by shape, never by content', async () => {
   assert.equal(r.shape, 'assistant/text/-/-/in_progress/end=0/parts=s/len=12 < user/text/-/-/finished_successfully/end=0/parts=s/len=12');
   assert.ok(!r.shape.includes('secret'));
 });
+
+// ---- empty turn (2.16.7): stream COMPLETE, reasoning only, branch frozen ----
+// Production shape (2026-10-29/30, 15 of 15 cases): the branch never changed again over 17–33
+// polls and the request ended in a 504 after 420–600 s.
+const COMPLETE = '200 {"status":"COMPLETE"}';
+function thinking({ thoughts = 1, inProgress = true } = {}) {
+  const data = conversation();
+  data.mapping.t1 = { id: 't1', parent: 'u1', children: [], message: { id: 't1', author: { role: 'assistant' },
+    recipient: 'all', status: inProgress ? 'in_progress' : 'finished_successfully',
+    content: { content_type: 'thoughts', thoughts: Array.from({ length: thoughts }, (_, i) => ({ summary: `s${i}`, content: `c${i}` })) } } };
+  data.mapping.u1.children = ['t1'];
+  data.current_node = 't1';
+  return data;
+}
+const okWith = (data, streamStatus) => ({ ...ok(data), streamStatus });
+
+test('a frozen reasoning-only turn with a COMPLETE stream fails fast as empty_turn', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [okWith(thinking(), COMPLETE)]);
+    let started;
+    const { output } = await logs(() => assert.rejects(
+      chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }).finally(() => { started = clock.now; }),
+      e => e.code === 'empty_turn' && /without an answer/.test(e.message) && /3 polls/.test(e.message)));
+    assert.equal(p.pollTimes.length, 3, 'gives up on the third identical poll');
+    assert.ok(started - NOW < 60000, `well before the 120s budget (${started - NOW}ms)`);
+    assert.deepEqual(p.actions.filter(a => a === 'reload'), []);
+    assert.match(output, /\[bg-poll\] #3 empty turn: stream_status COMPLETE/);
+    assert.match(output, /branch=assistant\/thoughts\/-\/all\/in_progress\/.*\/th=1 < user/);
+  });
+});
+
+test('reasoning that keeps moving is never cut, and its answer is returned', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const polls = [1, 2, 3, 4, 5, 6].map(n => okWith(thinking({ thoughts: n }), COMPLETE));
+    const done = conversation({ answer: 'thought through', complete: true });
+    polls.push(okWith(done, COMPLETE));
+    const { p, capture } = await setup(chat, page, queue, clock, polls);
+    const { result } = await logs(() => chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }));
+    assert.equal(result.text, 'thought through');
+    assert.equal(p.pollTimes.length, 7);
+  });
+});
+
+test('the count restarts at every change: two frozen polls, a step, then three frozen', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const a = okWith(thinking({ thoughts: 1 }), COMPLETE);
+    const b = okWith(thinking({ thoughts: 2 }), COMPLETE);
+    const { p, capture } = await setup(chat, page, queue, clock, [a, a, b, b, b]);
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }),
+      e => e.code === 'empty_turn'));
+    assert.equal(p.pollTimes.length, 5);
+  });
+});
+
+test('a transient poll error neither counts as a frozen poll nor resets the count', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const a = okWith(thinking(), COMPLETE);
+    const { p, capture } = await setup(chat, page, queue, clock, [a, new Error('signal is aborted without reason'), a, a]);
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }),
+      e => e.code === 'empty_turn'));
+    assert.equal(p.pollTimes.length, 4);
+  });
+});
+
+for (const [name, status] of [['still streaming', '200 {"status":"IS_STREAMING"}'], ['unknown', '200 {}'], ['unreadable', null]]) {
+  test(`a frozen turn whose stream status is ${name} waits for the budget`, async () => {
+    await fixture(ENV, async ({ chat, page, queue, clock }) => {
+      const { p, capture } = await setup(chat, page, queue, clock, [okWith(thinking(), status)]);
+      await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }),
+        e => e.code === 'timeout' && /within 120s/.test(e.message)));
+      assert.ok(p.pollTimes.length > 3);
+    });
+  });
+}
+
+test('only empty-looking polls count: a streaming poll in between restarts the count', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const a = okWith(thinking(), COMPLETE);
+    const s = okWith(thinking(), '200 {"status":"IS_STREAMING"}');
+    const { p, capture } = await setup(chat, page, queue, clock, [s, s, a, a, s, a, a, a]);
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }),
+      e => e.code === 'empty_turn'));
+    assert.equal(p.pollTimes.length, 8, 'the first COMPLETE after streaming polls is poll one of three');
+  });
+});
+
+test('frozen partial answer text is not an empty turn', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [okWith(conversation({ answer: 'half' }), COMPLETE)]);
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }),
+      e => e.code === 'timeout'));
+  });
+});
+
+test('a COMPLETE stream before the prompt reaches the branch is not an empty turn', async () => {
+  await fixture(ENV, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [okWith(conversation({ withPrompt: false }), COMPLETE)]);
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'instant' }),
+      e => e.code === 'timeout'));
+  });
+});
+
+test('CHAT_BG_POLL_EMPTY_POLLS sets how many frozen polls it takes', async () => {
+  await fixture({ ...ENV, CHAT_BG_POLL_EMPTY_POLLS: '5' }, async ({ chat, page, queue, clock }) => {
+    const { p, capture } = await setup(chat, page, queue, clock, [okWith(thinking(), COMPLETE)]);
+    await logs(() => assert.rejects(chat._test.waitAndExtractText(p, empty(), { capture, thinkingMode: 'extra_high' }),
+      e => e.code === 'empty_turn'));
+    assert.equal(p.pollTimes.length, 5);
+  });
+});
+
+test('empty_turn answers 502 with should_retry and its own error kind and metric', () => {
+  const { classifyError, shouldRetryKind, metricsHandler } = require('../src/metrics');
+  const { INFRA_ERROR_KINDS } = require('../src/progress');
+  assert.equal(classifyError('ChatGPT ended the turn without an answer', 'empty_turn'), 'empty_turn');
+  assert.equal(shouldRetryKind('empty_turn'), true);
+  assert.equal(INFRA_ERROR_KINDS.has('empty_turn'), false, 'an upstream drop must not count toward our health streak');
+  const { respondWithError } = require('../src/routes/images')._internals;
+  const res = { headers: {}, code: 0, body: null, set(k, v) { this.headers[k] = v; return this; },
+    status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
+  const err = new Error('ChatGPT ended the turn without an answer'); err.code = 'empty_turn';
+  respondWithError(res, Date.now(), err);
+  assert.equal(res.code, 502);
+  assert.equal(res.body.error_kind, 'empty_turn');
+  assert.equal(res.body.should_retry, true);
+  let body = '';
+  metricsHandler({}, { set() {}, send(b) { body = b; } });
+  assert.match(body, /gpt_web_gateway_errors_total\{type="empty_turn"\} [1-9]/, 'counted under its own kind');
+  assert.match(body, /gpt_web_gateway_duration_seconds_count\{result="empty_turn"\} [1-9]/);
+});

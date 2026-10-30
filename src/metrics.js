@@ -25,6 +25,10 @@ const counters = {
     // The prompt is too long for the only input path that keeps attachments / a composer
     // token (per-key typing). Deterministic for that input: not retried, not an infra failure.
     prompt_too_long: 0,
+    // ChatGPT closed the turn (stream_status COMPLETE) with reasoning only and no answer text,
+    // and the conversation stopped changing. Upstream failure, not our timeout: a retry is a
+    // fresh turn and usually answers.
+    empty_turn: 0,
   },
   generations_total: 0,
   edits_total: 0,
@@ -37,7 +41,7 @@ const DURATION_BUCKETS = [5, 10, 20, 30, 60, 90, 120, 180, 240, 300];
 const DURATION_LABELS = [
   'success', 'refused', 'policy_violation', 'rate_limit', 'login_failed',
   'timeout', 'server_error', 'queue_full', 'upload_failed', 'page_load_failed',
-  'conversation_not_found', 'tier_limit', 'prompt_too_long',
+  'conversation_not_found', 'tier_limit', 'prompt_too_long', 'empty_turn',
 ];
 
 function makeHistogramSeries() {
@@ -100,6 +104,8 @@ function shouldRetryKind(kind) {
     // Retryable on purpose: the tier is memoized as unavailable the moment this fires, so
     // the very next attempt is served one tier down instead of hitting the same wall.
     case 'tier_limit':
+    // A fresh turn usually answers: the empty one was dropped by ChatGPT, not by the input.
+    case 'empty_turn':
       return true;
     default:
       return false; // refused, policy_violation, rate_limit, invalid_request, unknown

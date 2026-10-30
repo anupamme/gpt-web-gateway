@@ -13,7 +13,7 @@ const {
   COMPOSER_SEL, COMPOSER_VISIBLE_SEL, SYSTEM_HINT_SEL, SEND_BUTTON_SEL, FILE_INPUT_SEL, ATTACHMENT_REMOVE_SEL,
   TIER_TRIGGER_SEL, TIER_TRIGGER_VISIBLE_SEL, TIER_CAPTION_RE, stripTierCaption, readComposerText,
 } = require('./composer-dom');
-const { SseAccumulator, parseSseBody, extractAssistantFromMapping, extractTurnAnswer, describeTurn, isValidConversationId } = require('./lib/conversation-read');
+const { SseAccumulator, parseSseBody, extractAssistantFromMapping, extractTurnAnswer, describeTurn, turnFingerprint, isValidConversationId } = require('./lib/conversation-read');
 const { trimConversationData } = require('./lib/conversation-trim');
 // Liveness heartbeat for /health/live — named `liveness` to avoid clashing with the
 // local `progress` indicator object inside waitAndExtractImage.
@@ -130,6 +130,16 @@ const BG_POLL_BUDGET_MS = {
 };
 const BG_POLL_FETCH_TIMEOUT_MS = 10000;
 const BG_POLL_MAX_ERRORS = 3;
+// Empty turn (2.16.7, 2026-10-30): stream_status says COMPLETE, the branch holds only
+// reasoning (last `thoughts` message stuck in_progress) and no answer text. In production
+// such a branch never changed again over 17–33 polls (up to 600 s) and ended in a 504. After
+// this many consecutive polls with an identical branch fingerprint the turn fails at once as
+// `empty_turn`. Any change on the branch — a thought growing, a new node, a status flip —
+// restarts the count, so a turn ChatGPT is still writing is never cut.
+const BG_POLL_EMPTY_POLLS = safePositiveInt(process.env.CHAT_BG_POLL_EMPTY_POLLS, 3);
+function streamStatusComplete(streamStatus) {
+  return typeof streamStatus === 'string' && /"status"\s*:\s*"COMPLETE"/.test(streamStatus);
+}
 // Classic path first (known payload shape); the app itself now loads `/conversations/{id}`.
 const BG_POLL_PATHS = ['/backend-api/conversation/{id}', '/backend-api/conversations/{id}'];
 // A user message created before this turn's capture opened (minus clock skew) belongs to a
@@ -1786,7 +1796,7 @@ async function pollConversation(p, conversationId, notBeforeSec) {
   const snap = extractTurnAnswer(res.data, { notBeforeSec });
   if (!snap) return { kind: 'unsupported', detail: `unparsable conversation from ${res.path}` };
   return { kind: 'ok', snap, path: res.path, streamStatus: res.streamStatus || null,
-    shape: snap.isComplete ? '' : describeTurn(res.data) };
+    shape: snap.isComplete ? '' : describeTurn(res.data), fingerprint: turnFingerprint(res.data) };
 }
 
 function backgroundPollBudgetMs(thinkingMode, inputMs) {
@@ -2002,6 +2012,20 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
           emitDelta(snap.lastAssistantText);
           return { text: snap.lastAssistantText, conversationId: snap.conversationId || bgPoll.id };
         }
+        // Only polls that already look empty (this turn, no text, stream COMPLETE) count; any
+        // other poll restarts the count, so a single COMPLETE never fails on its own.
+        const looksEmpty = snap.turnFound && !snap.lastAssistantText && streamStatusComplete(r.streamStatus);
+        if (!looksEmpty || !r.fingerprint) { bgPoll.fingerprint = null; bgPoll.samePolls = 0; }
+        else if (r.fingerprint === bgPoll.fingerprint) bgPoll.samePolls++;
+        else { bgPoll.fingerprint = r.fingerprint; bgPoll.samePolls = 1; }
+        if (looksEmpty && bgPoll.samePolls >= BG_POLL_EMPTY_POLLS) {
+          const sec = Math.round((Date.now() - start) / 1000);
+          console.log(`[bg-poll] #${bgPoll.polls} empty turn: stream_status COMPLETE, no answer text and the branch unchanged for ${bgPoll.samePolls} polls — giving up ${sec}s after submit`);
+          await saveDebugSnapshot(p, 'text_empty_turn').catch(() => {});
+          const err = new Error(`ChatGPT ended the turn without an answer: the response stream is complete, the conversation holds only reasoning and did not change for ${bgPoll.samePolls} polls (${sec}s after submit)`);
+          err.code = 'empty_turn';
+          throw err;
+        }
       } else {
         if (r.kind === 'error') bgPoll.errors++;
         console.log(`[bg-poll] #${bgPoll.polls} ${r.kind}: ${r.detail}`);
@@ -2044,7 +2068,8 @@ async function waitAndExtractText(p, beforeState = { assistantCount: 0, lastAssi
         conversationIdFromUrl(p.url()) || (capture && capture.snapshot().conversationId))) {
         const id = conversationIdFromUrl(p.url()) || capture.snapshot().conversationId;
         const budgetMs = backgroundPollBudgetMs(options.thinkingMode, options.inputMs);
-        bgPoll = { id, until: start + budgetMs, nextAt: Date.now(), errors: 0, polls: 0, lastView: null };
+        bgPoll = { id, until: start + budgetMs, nextAt: Date.now(), errors: 0, polls: 0, lastView: null,
+          fingerprint: null, samePolls: 0 };
         console.log(`[bg-poll] no rendered text for ${Math.round((Date.now() - lastProgressAt) / 1000)}s and the response stream is closed — polling the conversation every ${Math.round(BG_POLL_INTERVAL_MS / 1000)}s for up to ${Math.round(budgetMs / 1000)}s after submit instead of reloading`);
         logStallBackend(slotOf(p), capture);
         continue;

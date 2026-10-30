@@ -260,3 +260,85 @@ test('parseConversationPayload dispatches on payload shape', () => {
   assert.equal(parseConversationPayload(null), null);
   assert.equal(parseConversationPayload('not json at all'), null);
 });
+
+// ---- the production "empty turn" shape (2026-10-29/30) -------------------------------
+// assistant/thoughts in_progress < assistant/thoughts finished < user: reasoning only.
+const { extractTurnAnswer, describeTurn, turnFingerprint } = require('../src/lib/conversation-read');
+const T0 = 1_800_000_000;
+function turnBranch(extra = []) {
+  const mapping = {
+    root: { id: 'root', parent: null, children: ['u'], message: null },
+    u: { id: 'u', parent: 'root', children: ['t1'], message: { author: { role: 'user' }, create_time: T0,
+      status: 'finished_successfully', content: { content_type: 'text', parts: ['prompt'] } } },
+    t1: { id: 't1', parent: 'u', children: ['t2'], message: { author: { role: 'assistant' }, recipient: 'all',
+      status: 'finished_successfully', content: { content_type: 'thoughts', thoughts: [{ summary: 's', content: 'reasoning one' }] } } },
+    t2: { id: 't2', parent: 't1', children: [], message: { author: { role: 'assistant' }, recipient: 'all',
+      status: 'in_progress', content: { content_type: 'thoughts', thoughts: [{ summary: 's', content: 'reasoning two' }] } } },
+  };
+  let parent = 't2';
+  for (const [id, message] of extra) {
+    mapping[parent].children.push(id);
+    mapping[id] = { id, parent, children: [], message: { author: { role: 'assistant' }, ...message } };
+    parent = id;
+  }
+  return { conversation_id: CONV_ID, current_node: parent, mapping };
+}
+
+test('a reasoning-only turn has no answer text, whatever the thoughts say', () => {
+  const snap = extractTurnAnswer(turnBranch(), { notBeforeSec: T0 - 1 });
+  assert.deepEqual(snap, { conversationId: CONV_ID, turnFound: true, lastAssistantText: '', isComplete: false });
+  // reasoning_recap and a text message on a non-final channel are not answers either.
+  const recap = turnBranch([['r', { recipient: 'all', status: 'finished_successfully', end_turn: true,
+    content: { content_type: 'reasoning_recap', content: 'Thought for 2m' } }],
+  ['c', { recipient: 'all', channel: 'commentary', status: 'finished_successfully', content: { content_type: 'text', parts: ['note'] } }]]);
+  assert.equal(extractTurnAnswer(recap, { notBeforeSec: T0 - 1 }).lastAssistantText, '');
+});
+
+test('the final text after reasoning is taken in every form the reader accepts', () => {
+  const forms = [
+    { recipient: 'all', status: 'finished_successfully', content: { content_type: 'text', parts: ['answer'] } },
+    { recipient: 'all', channel: 'final', status: 'finished_successfully', content: { content_type: 'text', parts: ['answer'] } },
+    { status: 'in_progress', end_turn: true, content: { content_type: 'text', parts: ['answer'] } },
+    { recipient: 'all', status: 'in_progress', metadata: { is_complete: true }, content: { content_type: 'text', parts: ['ans', { text: 'wer' }] } },
+  ];
+  for (const form of forms) {
+    const snap = extractTurnAnswer(turnBranch([['a', form]]), { notBeforeSec: T0 - 1 });
+    assert.equal(snap.lastAssistantText, form.content.parts.length > 1 ? 'ans\nwer' : 'answer', JSON.stringify(form));
+    assert.equal(snap.isComplete, true, JSON.stringify(form));
+  }
+  const partial = extractTurnAnswer(turnBranch([['a', { status: 'in_progress', content: { content_type: 'text', parts: ['ans'] } }]]),
+    { notBeforeSec: T0 - 1 });
+  assert.equal(partial.lastAssistantText, 'ans');
+  assert.equal(partial.isComplete, false);
+});
+
+test('describeTurn reports the thought count, never their content', () => {
+  const shape = describeTurn(turnBranch());
+  assert.equal(shape, 'assistant/thoughts/-/all/in_progress/end=0/parts=-/len=0/th=1'
+    + ' < assistant/thoughts/-/all/finished_successfully/end=0/parts=-/len=0/th=1'
+    + ' < user/text/-/-/finished_successfully/end=0/parts=s/len=6');
+  assert.ok(!shape.includes('reasoning'));
+});
+
+test('turnFingerprint moves with any progress on the branch and only with it', () => {
+  const base = turnFingerprint(turnBranch());
+  assert.ok(base);
+  assert.equal(turnFingerprint(turnBranch()), base, 'same branch, same fingerprint');
+  assert.ok(!base.includes('reasoning'), 'content-free');
+  const grown = turnBranch(); grown.mapping.t2.message.content.thoughts.push({ summary: 's', content: 'more' });
+  const longer = turnBranch(); longer.mapping.t2.message.content.thoughts[0].content += '!';
+  const rewritten = turnBranch(); rewritten.mapping.t2.message.content.thoughts[0].content = 'reasoning TWO';
+  const flipped = turnBranch(); flipped.mapping.t2.message.status = 'finished_successfully';
+  const touched = turnBranch(); touched.mapping.t2.message.update_time = T0 + 5;
+  const ended = turnBranch(); ended.mapping.t2.message.end_turn = true;
+  const child = turnBranch(); child.mapping.t2.children.push('x');
+  const added = turnBranch([['t3', { recipient: 'all', status: 'in_progress', content: { content_type: 'thoughts', thoughts: [] } }]]);
+  for (const [name, d] of Object.entries({ grown, longer, rewritten, flipped, touched, ended, child, added })) {
+    assert.notEqual(turnFingerprint(d), base, name);
+  }
+  // Nodes above the prompt (earlier turns) do not belong to this turn.
+  const older = turnBranch(); older.mapping.root.children.push('zzz');
+  assert.equal(turnFingerprint(older), base);
+  assert.equal(turnFingerprint(null), '');
+  assert.equal(turnFingerprint({ mapping: null }), '');
+});

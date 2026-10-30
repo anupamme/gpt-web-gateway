@@ -379,6 +379,8 @@ function respondWithError(res, startedAt, err) {
     // Not 429: that is the global-cooldown path. One tier is out of quota, the service is fine.
     tier_limit: 503,
     page_load_failed: 503,
+    // ChatGPT finished the turn without an answer — a bad upstream reply, not a slow one.
+    empty_turn: 502,
     timeout: 504,
     server_error: 500,
   };

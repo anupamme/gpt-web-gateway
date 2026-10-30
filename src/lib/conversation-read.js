@@ -141,12 +141,48 @@ function describeTurn(data) {
       const c = m.content || {};
       const parts = Array.isArray(c.parts) ? c.parts.map(x => (typeof x === 'string' ? 's' : x && typeof x === 'object' ? (x.content_type || 'o') : typeof x)).join('+') : '-';
       out.push([m.author && m.author.role, c.content_type, m.channel || '-', m.recipient || '-', m.status || '-',
-        `end=${m.end_turn === true ? 1 : 0}`, `parts=${parts}`, `len=${messageText(m).length}`].join('/'));
+        `end=${m.end_turn === true ? 1 : 0}`, `parts=${parts}`, `len=${messageText(m).length}`]
+        .concat(Array.isArray(c.thoughts) ? [`th=${c.thoughts.length}`] : []).join('/'));
       if (m.author && m.author.role === 'user') break;
     }
     id = node.parent;
   }
   return out.join(' < ');
+}
+
+// 32-bit FNV-1a: a same-length rewrite of a thought still changes the fingerprint, while the
+// fingerprint itself stays content-free.
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16);
+}
+
+// Content-free fingerprint of the active branch down to the latest user message: node ids,
+// statuses, update times, content sizes and hashes. Equal fingerprints on consecutive polls mean the
+// turn did not move at all — not even its reasoning (thoughts grow `content` while they run).
+function turnFingerprint(data) {
+  const mapping = data && data.mapping;
+  if (!mapping || typeof mapping !== 'object') return '';
+  const out = [];
+  const seen = new Set();
+  let id = data.current_node;
+  while (id && mapping[id] && !seen.has(id)) {
+    seen.add(id);
+    const node = mapping[id];
+    const m = node && node.message;
+    const kids = Array.isArray(node.children) ? node.children.length : 0;
+    if (m) {
+      let body = '';
+      try { body = JSON.stringify(m.content || null); } catch {}
+      out.push([id, m.status || '-', m.update_time || '-', m.end_turn === true ? 1 : 0, body.length, fnv1a(body), kids].join(':'));
+      if (m.author && m.author.role === 'user') break;
+    } else {
+      out.push(`${id}:-:${kids}`);
+    }
+    id = node.parent;
+  }
+  return out.join('|');
 }
 
 // Incremental SSE accumulator. feed() raw chunk text as it arrives (chunks may split
@@ -330,6 +366,7 @@ module.exports = {
   extractAssistantFromMapping,
   extractTurnAnswer,
   describeTurn,
+  turnFingerprint,
   SseAccumulator,
   parseSseBody,
   parseConversationPayload,
